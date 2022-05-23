@@ -64,6 +64,7 @@ pub fn targetTriple(allocator: Allocator, target: *const std.Target) ![]const u8
         .avr => "avr",
         .bpfel => "bpfel",
         .bpfeb => "bpfeb",
+        .sbf => "sbf",
         .csky => "csky",
         .hexagon => "hexagon",
         .loongarch32 => "loongarch32",
@@ -235,6 +236,7 @@ pub fn targetTriple(allocator: Allocator, target: *const std.Target) ![]const u8
         .serenity => "serenity",
         .vulkan => "vulkan",
         .managarm => "managarm",
+        .solana => "solana",
 
         .@"3ds",
         .contiki,
@@ -366,6 +368,7 @@ pub fn dataLayout(target: *const std.Target) []const u8 {
         .avr => "e-P1-p:16:8-i8:8-i16:8-i32:8-i64:8-f32:8-f64:8-n8-a:8",
         .bpfeb => "E-m:e-p:64:64-i64:64-i128:128-n32:64-S128",
         .bpfel => "e-m:e-p:64:64-i64:64-i128:128-n32:64-S128",
+        .sbf => "e-m:e-p:64:64-i64:64-n32:64-S128",
         .msp430 => "e-m:e-p:16:16-i32:16-i64:16-f32:16-f64:16-a:8-n8:16-S16",
         .mips => "E-m:m-p:32:32-i8:8:32-i16:16:32-i64:64-n32-S64",
         .mipsel => "e-m:m-p:32:32-i8:8:32-i16:16:32-i64:64-n32-S64",
@@ -4504,7 +4507,7 @@ pub fn toLlvmCallConvTag(cc_tag: std.builtin.CallingConvention.Tag, target: *con
         .arc_sysv,
         .arc_interrupt,
         .avr_gnu,
-        .bpf_std,
+        .bpf_std, // TODO JC here?
         .csky_sysv,
         .hexagon_sysv,
         .hexagon_sysv_hvx,
@@ -4756,6 +4759,13 @@ pub fn initializeLLVMTarget(arch: std.Target.Cpu.Arch) void {
             bindings.LLVMInitializeBPFTargetMC();
             bindings.LLVMInitializeBPFAsmPrinter();
             bindings.LLVMInitializeBPFAsmParser();
+        },
+        .sbf => {
+            bindings.LLVMInitializeSBFTarget();
+            bindings.LLVMInitializeSBFTargetInfo();
+            bindings.LLVMInitializeSBFTargetMC();
+            bindings.LLVMInitializeSBFAsmPrinter();
+            bindings.LLVMInitializeSBFAsmParser();
         },
         .hexagon => {
             bindings.LLVMInitializeHexagonTarget();

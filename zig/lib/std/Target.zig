@@ -64,6 +64,7 @@ pub const Os = struct {
         cuda,
         mesa3d,
         nvcl,
+        solana,
         opencl,
         opengl,
         vulkan,
@@ -170,6 +171,7 @@ pub const Os = struct {
                 .emscripten,
 
                 .mesa3d,
+                .solana,
                 => .none,
 
                 .contiki,
@@ -399,6 +401,7 @@ pub const Os = struct {
                 .emscripten,
 
                 .mesa3d,
+                .solana,
                 => .{ .none = {} },
 
                 .contiki => .{
@@ -750,6 +753,7 @@ pub const powerpc = @import("Target/powerpc.zig");
 pub const propeller = @import("Target/propeller.zig");
 pub const riscv = @import("Target/riscv.zig");
 pub const s390x = @import("Target/s390x.zig");
+pub const sbf = @import("Target/sbf.zig");
 pub const sh = @import("Target/generic.zig");
 pub const sparc = @import("Target/sparc.zig");
 pub const spirv = @import("Target/spirv.zig");
@@ -942,6 +946,7 @@ pub const Abi = enum {
             .opencl,
             .opengl,
             .vulkan,
+            .solana,
             => .none,
         };
     }
@@ -1084,6 +1089,7 @@ pub fn toElfMachine(target: *const Target) std.elf.EM {
         .propeller => .PROPELLER,
         .riscv32, .riscv32be, .riscv64, .riscv64be => .RISCV,
         .s390x => .S390,
+        .sbf => .SBF,
         .sh, .sheb => .SH,
         .sparc => if (target.cpu.has(.sparc, .v9)) .SPARC32PLUS else .SPARC,
         .sparc64 => .SPARCV9,
@@ -1151,6 +1157,7 @@ pub fn toCoffMachine(target: *const Target) std.coff.IMAGE.FILE.MACHINE {
         .riscv32be,
         .riscv64be,
         .s390x,
+        .sbf,
         .sheb,
         .sparc,
         .sparc64,
@@ -1365,6 +1372,7 @@ pub const Cpu = struct {
         riscv64,
         riscv64be,
         s390x,
+        sbf,
         sh,
         sheb,
         sparc,
@@ -1429,6 +1437,7 @@ pub const Cpu = struct {
             propeller,
             riscv,
             s390x,
+            sbf,
             sh,
             sparc,
             spirv,
@@ -1465,6 +1474,7 @@ pub const Cpu = struct {
                 .propeller => .propeller,
                 .riscv32, .riscv32be, .riscv64, .riscv64be => .riscv,
                 .s390x => .s390x,
+                .sbf => .sbf,
                 .sh, .sheb => .sh,
                 .sparc, .sparc64 => .sparc,
                 .spirv32, .spirv64 => .spirv,
@@ -1617,7 +1627,7 @@ pub const Cpu = struct {
 
         pub inline fn isBpf(arch: Arch) bool {
             return switch (arch) {
-                .bpfel, .bpfeb => true,
+                .bpfel, .bpfeb, .sbf => true,
                 else => false,
             };
         }
@@ -1653,6 +1663,7 @@ pub const Cpu = struct {
                 .arc,
                 .avr,
                 .bpfel,
+                .sbf,
                 .csky,
                 .hexagon,
                 .kalimba,
@@ -1865,7 +1876,7 @@ pub const Cpu = struct {
                 => &.{.avr},
 
                 .bpf_std,
-                => &.{ .bpfel, .bpfeb },
+                => &.{ .bpfel, .bpfeb, .sbf },
 
                 .csky_sysv,
                 .csky_interrupt,
@@ -1988,6 +1999,7 @@ pub const Cpu = struct {
                 .propeller => &propeller.cpu.p1,
                 .riscv32, .riscv32be => &riscv.cpu.generic_rv32,
                 .riscv64, .riscv64be => &riscv.cpu.generic_rv64,
+                .sbf => &sbf.cpu.generic,
                 .sparc64 => &sparc.cpu.v9, // SPARC can only be 64-bit from v9 and up.
                 .wasm32, .wasm64 => &wasm.cpu.mvp,
                 .x86_16 => &x86.cpu.i86,
@@ -2230,6 +2242,7 @@ pub fn requiresLibC(target: *const Target) bool {
         .wasi,
         .emscripten,
         .uefi,
+        .solana,
         .opencl,
         .opengl,
         .vulkan,
@@ -2392,6 +2405,7 @@ pub const DynamicLinker = struct {
             .opencl,
             .opengl,
             .vulkan,
+            .solana,
 
             .ps3,
             .ps4,
@@ -2815,6 +2829,7 @@ pub const DynamicLinker = struct {
             .opencl,
             .opengl,
             .vulkan,
+            .solana,
             => none,
 
             // TODO go over each item in this list and either move it to the above list, or
@@ -2901,6 +2916,7 @@ pub fn ptrBitWidth_arch_abi(cpu_arch: Cpu.Arch, abi: Abi) u16 {
         .riscv64,
         .riscv64be,
         .s390x,
+        .sbf,
         .sparc64,
         .spirv64,
         .ve,
@@ -2941,6 +2957,7 @@ pub fn stackAlignment(target: *const Target) u16 {
         .loongarch64,
         .mips64,
         .mips64el,
+        .sbf,
         .sparc64,
         .ve,
         .wasm32,
@@ -3365,6 +3382,15 @@ pub fn cTypeBitSize(target: *const Target, c_type: CType) u16 {
             .longlong, .ulonglong, .double, .longdouble => return 64,
         },
 
+        .solana => switch (c_type) {
+            .char => return 8,
+            .short, .ushort => return 16,
+            .int, .uint, .float => return 32,
+            .long, .ulong => return target.ptrBitWidth(),
+            .longlong, .ulonglong, .double => return 64,
+            .longdouble => return 64,
+        },
+
         .ps3,
         .contiki,
         .managarm,
@@ -3431,6 +3457,7 @@ pub fn cTypeAlignment(target: *const Target, c_type: CType) u16 {
             .armeb,
             .bpfeb,
             .bpfel,
+            .sbf,
             .hexagon,
             .hppa,
             .lanai,
@@ -3538,6 +3565,7 @@ pub fn cTypePreferredAlignment(target: *const Target, c_type: CType) u16 {
             .armeb,
             .bpfeb,
             .bpfel,
+            .sbf,
             .hexagon,
             .hppa,
             .lanai,
@@ -3697,7 +3725,7 @@ pub fn cCallingConvention(target: *const Target) ?std.builtin.CallingConvention 
         .wasm32, .wasm64 => .{ .wasm_mvp = .{} },
         .arc, .arceb => .{ .arc_sysv = .{} },
         .avr => .avr_gnu,
-        .bpfel, .bpfeb => .{ .bpf_std = .{} },
+        .bpfel, .bpfeb, .sbf => .{ .bpf_std = .{} },
         .csky => .{ .csky_sysv = .{} },
         .hexagon => .{ .hexagon_sysv = .{} },
         .hppa => .{ .hppa_elf = .{} },

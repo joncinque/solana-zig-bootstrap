@@ -193,6 +193,7 @@ pub fn hasLlvmSupport(target: *const std.Target, ofmt: std.Target.ObjectFormat) 
         .avr,
         .bpfel,
         .bpfeb,
+        .sbf,
         .hexagon,
         .loongarch32,
         .loongarch64,
@@ -338,7 +339,7 @@ pub fn supportsReturnAddress(target: *const std.Target, optimize: std.builtin.Op
         // out into JavaScript and parsing a stack trace, which introduces significant
         // overhead that we would prefer to avoid in release builds.
         .wasm32, .wasm64 => target.os.tag == .emscripten and optimize == .Debug,
-        .bpfel, .bpfeb => false,
+        .bpfel, .bpfeb, .sbf => false,
         .spirv32, .spirv64 => false,
         else => true,
     };

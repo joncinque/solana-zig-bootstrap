@@ -1025,6 +1025,7 @@ pub const VaList = switch (builtin.cpu.arch) {
     .riscv32be,
     .riscv64,
     .riscv64be,
+    .sbf,
     .sparc,
     .sparc64,
     .spirv32,

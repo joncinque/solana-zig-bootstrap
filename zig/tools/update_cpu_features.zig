@@ -1500,6 +1500,13 @@ const targets = [_]ArchTarget{
         },
     },
     .{
+        .zig_name = "sbf",
+        .llvm = .{
+            .name = "SBF",
+            .td_name = "SBF",
+        },
+    },
+    .{
         .zig_name = "sparc",
         .llvm = .{
             .name = "Sparc",
