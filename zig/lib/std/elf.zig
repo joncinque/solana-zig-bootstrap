@@ -1602,6 +1602,9 @@ pub const EM = enum(u16) {
     /// This value is an unofficial ELF value used in: https://github.com/ne75/llvm-project
     PROPELLER2 = 300,
 
+    /// Solana Bytecode Format
+    SBF = 263,
+
     _,
 };
 

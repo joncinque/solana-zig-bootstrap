@@ -340,6 +340,16 @@ const targets = [_]std.Target.Query{
     .{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .gnu },
     .{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .itanium },
     .{ .cpu_arch = .x86_64, .os_tag = .windows, .abi = .msvc },
+    .{
+        .cpu_arch = .bpfel,
+        .os_tag = .freestanding,
+        .cpu_features_add = std.Target.bpf.featureSet(&.{.alu32}),
+    },
+    .{
+        .cpu_arch = .sbf,
+        .os_tag = .solana,
+        .cpu_features_add = std.Target.sbf.featureSet(&.{.static_syscalls}),
+    },
 
     .{ .cpu_arch = .xcore, .os_tag = .freestanding, .abi = .none },
 
