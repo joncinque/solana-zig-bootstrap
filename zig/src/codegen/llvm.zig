@@ -60,6 +60,7 @@ pub fn targetTriple(allocator: Allocator, target: std.Target) ![]const u8 {
         .avr => "avr",
         .bpfel => "bpfel",
         .bpfeb => "bpfeb",
+        .sbf => "sbf",
         .csky => "csky",
         .hexagon => "hexagon",
         .loongarch32 => "loongarch32",
@@ -223,6 +224,7 @@ pub fn targetTriple(allocator: Allocator, target: std.Target) ![]const u8 {
         .visionos => "xros",
         .serenity => "serenity",
         .vulkan => "vulkan",
+        .solana => "solana",
 
         .opengl,
         .plan9,
@@ -389,7 +391,8 @@ const DataLayoutBuilder = struct {
                 self.target.cpu.arch != .loongarch64 and
                 !(self.target.cpu.arch == .aarch64 and
                     (self.target.os.tag == .uefi or self.target.os.tag == .windows)) and
-                self.target.cpu.arch != .bpfeb and self.target.cpu.arch != .bpfel) continue;
+                self.target.cpu.arch != .bpfeb and self.target.cpu.arch != .bpfel and
+                self.target.cpu.arch != .sbf) continue;
             try writer.writeAll("-p");
             if (info.llvm != .default) try writer.print("{d}", .{@intFromEnum(info.llvm)});
             try writer.print(":{d}:{d}", .{ size, abi });
@@ -481,6 +484,7 @@ const DataLayoutBuilder = struct {
             .amdgcn,
             .bpfeb,
             .bpfel,
+            .sbf,
             .loongarch64,
             .mips64,
             .mips64el,
@@ -602,6 +606,7 @@ const DataLayoutBuilder = struct {
                     },
                     .bpfeb,
                     .bpfel,
+                    .sbf,
                     .nvptx,
                     .nvptx64,
                     .riscv64,
@@ -12932,6 +12937,13 @@ pub fn initializeLLVMTarget(arch: std.Target.Cpu.Arch) void {
             llvm.LLVMInitializeBPFTargetMC();
             llvm.LLVMInitializeBPFAsmPrinter();
             llvm.LLVMInitializeBPFAsmParser();
+        },
+        .sbf => {
+            llvm.LLVMInitializeSBFTarget();
+            llvm.LLVMInitializeSBFTargetInfo();
+            llvm.LLVMInitializeSBFTargetMC();
+            llvm.LLVMInitializeSBFAsmPrinter();
+            llvm.LLVMInitializeSBFAsmParser();
         },
         .hexagon => {
             llvm.LLVMInitializeHexagonTarget();

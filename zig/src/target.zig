@@ -153,6 +153,7 @@ pub fn hasLlvmSupport(target: std.Target, ofmt: std.Target.ObjectFormat) bool {
         .avr,
         .bpfel,
         .bpfeb,
+        .sbf,
         .csky,
         .hexagon,
         .loongarch32,
@@ -251,7 +252,7 @@ pub fn libcProvidesStackProtector(target: std.Target) bool {
 pub fn supportsReturnAddress(target: std.Target) bool {
     return switch (target.cpu.arch) {
         .wasm32, .wasm64 => target.os.tag == .emscripten,
-        .bpfel, .bpfeb => false,
+        .bpfel, .bpfeb, .sbf => false,
         .spirv, .spirv32, .spirv64 => false,
         else => true,
     };

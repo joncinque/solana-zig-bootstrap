@@ -63,6 +63,7 @@ pub const Os = struct {
         cuda,
         mesa3d,
         nvcl,
+        solana,
         opencl,
         opengl,
         vulkan,
@@ -171,6 +172,7 @@ pub const Os = struct {
                 .emscripten,
 
                 .mesa3d,
+                .solana,
                 => .none,
 
                 .contiki,
@@ -415,6 +417,7 @@ pub const Os = struct {
                 .emscripten,
 
                 .mesa3d,
+                .solana,
                 => .{ .none = {} },
 
                 .contiki => .{
@@ -716,6 +719,7 @@ pub const Os = struct {
             .hurd,
             .wasi,
             .emscripten,
+            .solana,
             .uefi,
             .opencl,
             .opengl,
@@ -744,6 +748,7 @@ pub const nvptx = @import("Target/nvptx.zig");
 pub const powerpc = @import("Target/powerpc.zig");
 pub const propeller = @import("Target/propeller.zig");
 pub const riscv = @import("Target/riscv.zig");
+pub const sbf = @import("Target/sbf.zig");
 pub const sparc = @import("Target/sparc.zig");
 pub const spirv = @import("Target/spirv.zig");
 pub const s390x = @import("Target/s390x.zig");
@@ -922,6 +927,7 @@ pub const Abi = enum {
             .opencl,
             .opengl,
             .vulkan,
+            .solana,
             => .none,
         };
     }
@@ -1068,6 +1074,7 @@ pub fn toElfMachine(target: Target) std.elf.EM {
         .propeller => .PROPELLER,
         .riscv32, .riscv64 => .RISCV,
         .s390x => .S390,
+        .sbf => .SBF,
         .sparc => if (Target.sparc.featureSetHas(target.cpu.features, .v9)) .SPARC32PLUS else .SPARC,
         .sparc64 => .SPARCV9,
         .ve => .VE,
@@ -1124,6 +1131,7 @@ pub fn toCoffMachine(target: Target) std.coff.MachineType {
         .powerpc64,
         .powerpc64le,
         .s390x,
+        .sbf,
         .sparc,
         .sparc64,
         .spirv,
@@ -1351,6 +1359,7 @@ pub const Cpu = struct {
         riscv32,
         riscv64,
         s390x,
+        sbf,
         sparc,
         sparc64,
         spirv,
@@ -1485,7 +1494,7 @@ pub const Cpu = struct {
 
         pub inline fn isBpf(arch: Arch) bool {
             return switch (arch) {
-                .bpfel, .bpfeb => true,
+                .bpfel, .bpfeb, .sbf => true,
                 else => false,
             };
         }
@@ -1513,6 +1522,7 @@ pub const Cpu = struct {
                 .aarch64,
                 .amdgcn,
                 .bpfel,
+                .sbf,
                 .csky,
                 .xtensa,
                 .hexagon,
@@ -1577,6 +1587,7 @@ pub const Cpu = struct {
                 .nvptx, .nvptx64 => "nvptx",
                 .wasm32, .wasm64 => "wasm",
                 .spirv, .spirv32, .spirv64 => "spirv",
+                .sbf => "sbf",
                 else => @tagName(arch),
             };
         }
@@ -1599,6 +1610,7 @@ pub const Cpu = struct {
                 .powerpc, .powerpcle, .powerpc64, .powerpc64le => &powerpc.all_features,
                 .amdgcn => &amdgcn.all_features,
                 .riscv32, .riscv64 => &riscv.all_features,
+                .sbf => &sbf.all_features,
                 .sparc, .sparc64 => &sparc.all_features,
                 .spirv, .spirv32, .spirv64 => &spirv.all_features,
                 .s390x => &s390x.all_features,
@@ -1631,6 +1643,7 @@ pub const Cpu = struct {
                 .powerpc, .powerpcle, .powerpc64, .powerpc64le => comptime allCpusFromDecls(powerpc.cpu),
                 .amdgcn => comptime allCpusFromDecls(amdgcn.cpu),
                 .riscv32, .riscv64 => comptime allCpusFromDecls(riscv.cpu),
+                .sbf => comptime allCpusFromDecls(sbf.cpu),
                 .sparc, .sparc64 => comptime allCpusFromDecls(sparc.cpu),
                 .spirv, .spirv32, .spirv64 => comptime allCpusFromDecls(spirv.cpu),
                 .s390x => comptime allCpusFromDecls(s390x.cpu),
@@ -1771,7 +1784,7 @@ pub const Cpu = struct {
                 => &.{.avr},
 
                 .bpf_std,
-                => &.{ .bpfel, .bpfeb },
+                => &.{ .bpfel, .bpfeb, .sbf },
 
                 .csky_sysv,
                 .csky_interrupt,
@@ -1882,6 +1895,7 @@ pub const Cpu = struct {
                 .propeller => &propeller.cpu.p1,
                 .riscv32 => &riscv.cpu.generic_rv32,
                 .riscv64 => &riscv.cpu.generic_rv64,
+                .sbf => &sbf.cpu.generic,
                 .spirv, .spirv32, .spirv64 => &spirv.cpu.generic,
                 .sparc => &sparc.cpu.generic,
                 .sparc64 => &sparc.cpu.v9, // 64-bit SPARC needs v9 as the baseline
@@ -2154,6 +2168,7 @@ pub const DynamicLinker = struct {
             .opencl,
             .opengl,
             .vulkan,
+            .solana,
 
             .ps3,
             .ps4,
@@ -2552,6 +2567,7 @@ pub const DynamicLinker = struct {
             .opencl,
             .opengl,
             .vulkan,
+            .solana,
             => none,
 
             // TODO go over each item in this list and either move it to the above list, or
@@ -2618,6 +2634,7 @@ pub fn ptrBitWidth_cpu_abi(cpu: Cpu, abi: Abi) u16 {
         .amdgcn,
         .bpfel,
         .bpfeb,
+        .sbf,
         .sparc64,
         .s390x,
         .ve,
@@ -2652,6 +2669,7 @@ pub fn stackAlignment(target: Target) u16 {
         .aarch64_be,
         .bpfeb,
         .bpfel,
+        .sbf,
         .loongarch32,
         .loongarch64,
         .mips64,
@@ -3057,6 +3075,15 @@ pub fn cTypeBitSize(target: Target, c_type: CType) u16 {
             .longdouble => return 80,
         },
 
+        .solana => switch (c_type) {
+            .char => return 8,
+            .short, .ushort => return 16,
+            .int, .uint, .float => return 32,
+            .long, .ulong => return target.ptrBitWidth(),
+            .longlong, .ulonglong, .double => return 64,
+            .longdouble => return 64,
+        },
+
         .ps3,
         .contiki,
         .opengl,
@@ -3123,6 +3150,7 @@ pub fn cTypeAlignment(target: Target, c_type: CType) u16 {
             .amdgcn,
             .bpfel,
             .bpfeb,
+            .sbf,
             .hexagon,
             .m68k,
             .mips,
@@ -3218,6 +3246,7 @@ pub fn cTypePreferredAlignment(target: Target, c_type: CType) u16 {
             .amdgcn,
             .bpfel,
             .bpfeb,
+            .sbf,
             .hexagon,
             .x86,
             .m68k,
@@ -3299,7 +3328,7 @@ pub fn cCallingConvention(target: Target) ?std.builtin.CallingConvention {
         .wasm32, .wasm64 => .{ .wasm_mvp = .{} },
         .arc => .{ .arc_sysv = .{} },
         .avr => .avr_gnu,
-        .bpfel, .bpfeb => .{ .bpf_std = .{} },
+        .bpfel, .bpfeb, .sbf => .{ .bpf_std = .{} },
         .csky => .{ .csky_sysv = .{} },
         .hexagon => .{ .hexagon_sysv = .{} },
         .kalimba => null,
