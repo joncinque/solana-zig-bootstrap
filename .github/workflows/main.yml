@@ -1,0 +1,76 @@
+name: Build compiler for Windows, Linux and Mac
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version (e.g. 1.42)
+        required: false
+        type: string
+
+jobs:
+  build:
+    name: Build zig
+    runs-on: ubuntu-latest
+    timeout-minutes: 600
+    strategy:
+      matrix:
+        include:
+        - target: x86_64-linux-musl
+        - target: x86_64-macos-none
+        - target: x86_64-windows-gnu
+        - target: aarch64-linux-musl
+        - target: aarch64-macos-none
+      fail-fast: false
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: true
+    - name: Build
+      run: CMAKE_GENERATOR=Ninja ./build ${{ matrix.target }} baseline
+      shell: bash
+    - name: Create zig tarball
+      run: tar -C out -cjf zig-${{ matrix.target }}.tar.bz2 zig-${{ matrix.target }}-baseline
+    - name: Upload zig tarball
+      uses: actions/upload-artifact@v4
+      with:
+        name: zig-${{ matrix.target }}.tar.bz2
+        path: zig-${{ matrix.target }}.tar.bz2
+    - name: Prep llvm dir (remove unused stuff, rename)
+      run: ./trim-llvm-release.sh ${{ matrix.target }}
+    - name: Create llvm tarball
+      run: tar -C out -cjf llvm-${{ matrix.target }}.tar.bz2 llvm-${{ matrix.target }}-baseline
+    - name: Upload llvm tarball
+      uses: actions/upload-artifact@v4
+      with:
+        name: llvm-${{ matrix.target }}.tar.bz2
+        path: llvm-${{ matrix.target }}.tar.bz2
+
+  create_release:
+    name: Create Release
+    if: github.event.inputs.version != ''
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Update the version in the README
+      run: sed -i 's/# solana-zig-bootstrap v.*/# solana-zig-bootstrap v${{ inputs.version }}/' README.md
+    - name: Commit and push tag
+      run: |
+        git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git config --global user.name "github-actions[bot]"
+        git commit -am "[SOL] Publish solana-v${{ inputs.version }}"
+        git tag -a solana-v${{ inputs.version }} -m "[SOL] Tag solana-v${{ inputs.version }}"
+        git push origin --follow-tags
+    - name: Download tarballs for release
+      uses: actions/download-artifact@v4
+      with:
+        merge-multiple: true
+    - name: Create GH Release
+      uses: softprops/action-gh-release@v2
+      with:
+        fail_on_unmatched_files: true
+        files: |
+          zig-*.tar.bz2
+          llvm-*.tar.bz2
+        tag_name: solana-v${{ inputs.version }}
