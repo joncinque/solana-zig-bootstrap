@@ -13,8 +13,8 @@ pub const default_stack_protector_buffer_size = 4;
 pub fn canDynamicLink(target: *const std.Target) bool {
     return switch (target.cpu.arch) {
         .amdgcn,
-        .bpfeb,
-        .bpfel,
+        //.bpfeb,
+        //.bpfel,
         .nvptx,
         .nvptx64,
         .spirv32,
@@ -25,7 +25,9 @@ pub fn canDynamicLink(target: *const std.Target) bool {
         => true,
         else => switch (target.os.tag) {
             // This list is likely incomplete.
-            .freestanding, .uefi => false,
+            //.freestanding,
+            .uefi,
+            => false,
             else => true,
         },
     };
