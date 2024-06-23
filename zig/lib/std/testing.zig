@@ -32,14 +32,14 @@ pub var allocator_instance: std.heap.GeneralPurposeAllocator(.{
 pub var log_level = std.log.Level.warn;
 
 // Disable printing in tests for simple backends.
-pub const backend_can_print = switch (builtin.zig_backend) {
+pub const backend_can_print = (switch (builtin.zig_backend) {
     .stage2_aarch64,
     .stage2_powerpc,
     .stage2_riscv64,
     .stage2_spirv,
     => false,
     else => true,
-};
+} and builtin.os.tag != .solana);
 
 fn print(comptime fmt: []const u8, args: anytype) void {
     if (@inComptime()) {
