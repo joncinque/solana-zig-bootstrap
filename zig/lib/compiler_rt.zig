@@ -301,11 +301,31 @@ comptime {
 
         _ = @import("compiler_rt/memcpy.zig");
         if (!ofmt_c) {
-            symbol(&memset, "memset");
+            if (builtin.os.tag == .solana) {
+                const Syscall = struct {
+                    extern fn sol_memset_(dest: ?[*]u8, c: u8, len: usize) callconv(.c) ?[*]u8;
+                    pub fn sol_memset(dest: ?[*]u8, c: u8, len: usize) callconv(.c) ?[*]u8 {
+                        return sol_memset_(dest, c, len);
+                    }
+                };
+                symbol(&Syscall.sol_memset, "memset");
+            } else {
+                symbol(&memset, "memset");
+            }
             symbol(&__memset, "__memset");
         }
         _ = @import("compiler_rt/memmove.zig");
-        symbol(&memcmp, "memcmp");
+        if (builtin.os.tag == .solana) {
+            const Syscall = struct {
+                extern fn sol_memcmp_(vl: [*]const u8, vr: [*]const u8, n: usize) callconv(.c) c_int;
+                pub fn sol_memcmp(vl: [*]const u8, vr: [*]const u8, n: usize) callconv(.c) c_int {
+                    return sol_memcmp_(vl, vr, n);
+                }
+            };
+            symbol(&Syscall.sol_memcmp, "memcmp");
+        } else {
+            symbol(&memcmp, "memcmp");
+        }
         symbol(&bcmp, "bcmp");
         _ = @import("compiler_rt/ssp.zig");
         symbol(&strlen, "strlen");
