@@ -14,10 +14,21 @@ comptime {
             .visibility = common.visibility,
         };
 
-        if (builtin.mode == .ReleaseSmall or builtin.zig_backend == .stage2_aarch64)
-            @export(&memmoveSmall, export_options)
-        else
-            @export(&memmoveFast, export_options);
+        if (builtin.os.tag == .solana) {
+            const Syscall = struct {
+                extern fn sol_memmove_(dest: ?[*]u8, src: ?[*]const u8, n: usize) callconv(.c) void;
+                pub fn sol_memmove(dest: ?[*]u8, src: ?[*]const u8, n: usize) callconv(.c) ?[*]u8 {
+                    sol_memmove_(dest, src, n);
+                    return dest;
+                }
+            };
+            @export(&Syscall.sol_memmove, export_options);
+        } else {
+            if (builtin.mode == .ReleaseSmall or builtin.zig_backend == .stage2_aarch64)
+                @export(&memmoveSmall, export_options)
+            else
+                @export(&memmoveFast, export_options);
+        }
     }
 }
 

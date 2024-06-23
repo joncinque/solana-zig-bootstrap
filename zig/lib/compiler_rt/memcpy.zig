@@ -11,10 +11,21 @@ comptime {
             .visibility = common.visibility,
         };
 
-        if (builtin.mode == .ReleaseSmall or builtin.zig_backend == .stage2_aarch64)
-            @export(&memcpySmall, export_options)
-        else
-            @export(&memcpyFast, export_options);
+        if (builtin.os.tag == .solana) {
+            const Syscall = struct {
+                extern fn sol_memcpy_(noalias dest: ?[*]u8, noalias src: ?[*]const u8, len: usize) callconv(.c) void;
+                pub fn sol_memcpy(noalias dest: ?[*]u8, noalias src: ?[*]const u8, len: usize) callconv(.c) ?[*]u8 {
+                    sol_memcpy_(dest, src, len);
+                    return dest;
+                }
+            };
+            @export(&Syscall.sol_memcpy, export_options);
+        } else {
+            if (builtin.mode == .ReleaseSmall or builtin.zig_backend == .stage2_aarch64)
+                @export(&memcpySmall, export_options)
+            else
+                @export(&memcpyFast, export_options);
+        }
     }
 }
 
