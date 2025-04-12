@@ -3306,6 +3306,7 @@ pub fn cMaxIntAlignment(target: *const Target) u16 {
         .powerpcle,
         .riscv32,
         .s390x,
+        .sbf,
         => 8,
 
         // Even LLVMABIAlignmentOfType(i128) agrees on these targets.
