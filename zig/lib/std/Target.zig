@@ -3646,6 +3646,7 @@ pub fn cMaxIntAlignment(target: *const Target) u16 {
         .riscv32,
         .riscv32be,
         .s390x,
+        .sbf,
         .sparc,
         .thumb,
         .thumbeb,
