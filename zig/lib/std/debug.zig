@@ -589,7 +589,8 @@ pub fn panicExtra(
 ) noreturn {
     @branchHint(.cold);
 
-    const size = 0x1000;
+    // limit the size of this string to avoid blowing out stack size
+    const size = if (native_os == .solana) 0x0f00 else 0x1000;
     const trunc_msg = "(msg truncated)";
     var buf: [size + trunc_msg.len]u8 = undefined;
     var bw: Writer = .fixed(buf[0..size]);
@@ -667,7 +668,7 @@ pub fn defaultPanic(
             }
             @trap();
         },
-        .cuda, .amdhsa => std.posix.abort(),
+        .cuda, .amdhsa, .solana => std.posix.abort(),
         .plan9 => {
             var status: [std.os.plan9.ERRMAX]u8 = undefined;
             const len = @min(msg.len, status.len - 1);
