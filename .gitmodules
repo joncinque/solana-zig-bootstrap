@@ -1,0 +1,4 @@
+[submodule "llvm-project-solana"]
+	path = llvm-project-solana
+	url = https://github.com/joncinque/llvm-project-solana
+	branch = solana-1.47
