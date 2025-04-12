@@ -1688,6 +1688,7 @@ pub fn maxIntAlignment(target: std.Target) u16 {
         .riscv64,
         .bpfel,
         .bpfeb,
+        .sbf,
         .nvptx,
         .nvptx64,
         => 16,
