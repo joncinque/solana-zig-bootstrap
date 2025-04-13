@@ -42,7 +42,6 @@ cmake "$ROOTDIR/llvm-project-solana/llvm" \
   -DLLVM_INCLUDE_EXAMPLES=OFF \
   -DLLVM_INCLUDE_BENCHMARKS=OFF \
   -DLLVM_INCLUDE_DOCS=OFF \
-  -DLLVM_EXPERIMENTAL_TARGETS_TO_BUILD="BPF;SBF" \
   -DLLVM_TOOL_LLVM_LTO2_BUILD=OFF \
   -DLLVM_TOOL_LLVM_LTO_BUILD=OFF \
   -DLLVM_TOOL_LTO_BUILD=OFF \
@@ -135,6 +134,12 @@ $ZIG build-lib \
   "$ROOTDIR/zstd/lib/dictBuilder/fastcover.c" \
   "$ROOTDIR/zstd/lib/dictBuilder/cover.c"
 
+# For some reason, the output lib name doesn't work with cmake on windows, so
+# copy it to the correct name
+if [ "$TARGET_OS_CMAKE" = "Windows" ]; then
+  cp zstd.lib libzstd.a
+fi
+
 # Rebuild LLVM with Zig.
 mkdir -p "$ROOTDIR/out/build-llvm-$TARGET-$MCPU"
 cd "$ROOTDIR/out/build-llvm-$TARGET-$MCPU"
@@ -151,6 +156,8 @@ cmake "$ROOTDIR/llvm-project-solana/llvm" \
   -DCMAKE_RC_COMPILER="$ROOTDIR/out/host/bin/llvm-rc" \
   -DCMAKE_AR="$ROOTDIR/out/host/bin/llvm-ar" \
   -DCMAKE_RANLIB="$ROOTDIR/out/host/bin/llvm-ranlib" \
+  -DCMAKE_C_LINKER_DEPFILE_SUPPORTED=False \
+  -DCMAKE_CXX_LINKER_DEPFILE_SUPPORTED=False \
   -DLLVM_ENABLE_BACKTRACES=OFF \
   -DLLVM_ENABLE_BINDINGS=OFF \
   -DLLVM_ENABLE_CRASH_OVERRIDES=OFF \
@@ -163,7 +170,6 @@ cmake "$ROOTDIR/llvm-project-solana/llvm" \
   -DLLVM_ENABLE_Z3_SOLVER=OFF \
   -DLLVM_ENABLE_ZLIB=FORCE_ON \
   -DLLVM_ENABLE_ZSTD=FORCE_ON \
-  -DLLVM_EXPERIMENTAL_TARGETS_TO_BUILD="BPF;SBF" \
   -DLLVM_USE_STATIC_ZSTD=ON \
   -DLLVM_TABLEGEN="$ROOTDIR/out/host/bin/llvm-tblgen" \
   -DLLVM_BUILD_UTILS=OFF \
