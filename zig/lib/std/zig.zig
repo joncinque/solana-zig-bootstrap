@@ -3,23 +3,27 @@
 //! guarantees whatsoever.
 
 const std = @import("std.zig");
-const tokenizer = @import("zig/tokenizer.zig");
 const assert = std.debug.assert;
+const mem = std.mem;
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Writer = std.Io.Writer;
+
+const tokenizer = @import("zig/tokenizer.zig");
 
 pub const ErrorBundle = @import("zig/ErrorBundle.zig");
 pub const Server = @import("zig/Server.zig");
 pub const Client = @import("zig/Client.zig");
 pub const Token = tokenizer.Token;
 pub const Tokenizer = tokenizer.Tokenizer;
+pub const TokenSmith = @import("zig/TokenSmith.zig");
 pub const string_literal = @import("zig/string_literal.zig");
 pub const number_literal = @import("zig/number_literal.zig");
 pub const primitives = @import("zig/primitives.zig");
 pub const isPrimitive = primitives.isPrimitive;
 pub const Ast = @import("zig/Ast.zig");
 pub const AstGen = @import("zig/AstGen.zig");
+pub const AstSmith = @import("zig/AstSmith.zig");
 pub const Zir = @import("zig/Zir.zig");
 pub const Zoir = @import("zig/Zoir.zig");
 pub const ZonGen = @import("zig/ZonGen.zig");
@@ -93,7 +97,7 @@ pub const Loc = struct {
     source_line: []const u8,
 
     pub fn eql(a: Loc, b: Loc) bool {
-        return a.line == b.line and a.column == b.column and std.mem.eql(u8, a.source_line, b.source_line);
+        return a.line == b.line and a.column == b.column and mem.eql(u8, a.source_line, b.source_line);
     }
 };
 
@@ -257,7 +261,7 @@ pub const BuildId = union(enum) {
         if (a_tag != b_tag) return false;
         return switch (a) {
             .none, .fast, .uuid, .sha1, .md5 => true,
-            .hexstring => |a_hexstring| std.mem.eql(u8, a_hexstring.toSlice(), b.hexstring.toSlice()),
+            .hexstring => |a_hexstring| mem.eql(u8, a_hexstring.toSlice(), b.hexstring.toSlice()),
         };
     }
 
@@ -284,17 +288,17 @@ pub const BuildId = union(enum) {
 
     /// Converts UTF-8 text to a `BuildId`.
     pub fn parse(text: []const u8) !BuildId {
-        if (std.mem.eql(u8, text, "none")) {
+        if (mem.eql(u8, text, "none")) {
             return .none;
-        } else if (std.mem.eql(u8, text, "fast")) {
+        } else if (mem.eql(u8, text, "fast")) {
             return .fast;
-        } else if (std.mem.eql(u8, text, "uuid")) {
+        } else if (mem.eql(u8, text, "uuid")) {
             return .uuid;
-        } else if (std.mem.eql(u8, text, "sha1") or std.mem.eql(u8, text, "tree")) {
+        } else if (mem.eql(u8, text, "sha1") or mem.eql(u8, text, "tree")) {
             return .sha1;
-        } else if (std.mem.eql(u8, text, "md5")) {
+        } else if (mem.eql(u8, text, "md5")) {
             return .md5;
-        } else if (std.mem.startsWith(u8, text, "0x")) {
+        } else if (mem.startsWith(u8, text, "0x")) {
             var result: BuildId = .{ .hexstring = undefined };
             const slice = try std.fmt.hexToBytes(&result.hexstring.bytes, text[2..]);
             result.hexstring.len = @as(u8, @intCast(slice.len));
@@ -613,13 +617,13 @@ pub fn readSourceFileToEndAlloc(gpa: Allocator, file_reader: *Io.File.Reader) ![
         "\xfe\xff", // UTF-16 big endian
     };
     for (unsupported_boms) |bom| {
-        if (std.mem.startsWith(u8, buffer.items, bom)) {
+        if (mem.startsWith(u8, buffer.items, bom)) {
             return error.UnsupportedEncoding;
         }
     }
 
     // If the file starts with a UTF-16 little endian BOM, translate it to UTF-8
-    if (std.mem.startsWith(u8, buffer.items, "\xff\xfe")) {
+    if (mem.startsWith(u8, buffer.items, "\xff\xfe")) {
         if (buffer.items.len % 2 != 0) return error.InvalidEncoding;
         return std.unicode.utf16LeToUtf8AllocZ(gpa, @ptrCast(@alignCast(buffer.items))) catch |err| switch (err) {
             error.DanglingSurrogateHalf => error.UnsupportedEncoding,
@@ -650,10 +654,20 @@ pub fn putAstErrorsIntoBundle(
     path: []const u8,
     wip_errors: *std.zig.ErrorBundle.Wip,
 ) Allocator.Error!void {
-    var zir = try AstGen.generate(gpa, tree);
-    defer zir.deinit(gpa);
+    switch (tree.mode) {
+        .zig => {
+            var zir = try AstGen.generate(gpa, tree);
+            defer zir.deinit(gpa);
 
-    try wip_errors.addZirErrorMessages(zir, tree, tree.source, path);
+            try wip_errors.addZirErrorMessages(zir, tree, tree.source, path);
+        },
+        .zon => {
+            var zoir = try ZonGen.generate(gpa, tree, .{});
+            defer zoir.deinit(gpa);
+
+            try wip_errors.addZoirErrorMessages(zoir, tree, tree.source, path);
+        },
+    }
 }
 
 pub fn resolveTargetQueryOrFatal(io: Io, target_query: std.Target.Query) std.Target {
@@ -737,7 +751,6 @@ pub const EnvVar = enum {
     ZIG_BUILD_MULTILINE_ERRORS,
     ZIG_VERBOSE_LINK,
     ZIG_VERBOSE_CC,
-    ZIG_BTRFS_WORKAROUND,
     ZIG_DEBUG_CMD,
     ZIG_IS_DETECTING_LIBC_PATHS,
     ZIG_IS_TRYING_TO_NOT_CALL_ITSELF,
@@ -837,6 +850,10 @@ pub const SimpleComptimeReason = enum(u32) {
     tuple_field_types,
     enum_field_names,
     enum_field_values,
+    union_enum_tag_type,
+    enum_int_tag_type,
+    packed_struct_backing_int_type,
+    packed_union_backing_int_type,
 
     // Evaluating at comptime because decl/field name must be comptime-known.
     decl_name,
@@ -864,7 +881,7 @@ pub const SimpleComptimeReason = enum(u32) {
     casted_to_comptime_enum,
     casted_to_comptime_int,
     casted_to_comptime_float,
-    panic_handler,
+    std_builtin_decl,
 
     pub fn message(r: SimpleComptimeReason) []const u8 {
         return switch (r) {
@@ -925,6 +942,11 @@ pub const SimpleComptimeReason = enum(u32) {
             .enum_field_names    => "enum field names must be comptime-known",
             .enum_field_values   => "enum field values must be comptime-known",
 
+            .union_enum_tag_type            => "enum tag type of union must be comptime-known",
+            .enum_int_tag_type              => "integer tag type of enum must be comptime-known",
+            .packed_struct_backing_int_type => "packed struct backing integer type must be comptime-known",
+            .packed_union_backing_int_type  => "packed struct backing integer type must be comptime-known",
+
             .decl_name         => "declaration name must be comptime-known",
             .field_name        => "field name must be comptime-known",
             .tuple_field_index => "tuple field index must be comptime-known",
@@ -948,7 +970,7 @@ pub const SimpleComptimeReason = enum(u32) {
             .casted_to_comptime_enum      => "value casted to enum with 'comptime_int' tag type must be comptime-known",
             .casted_to_comptime_int       => "value casted to 'comptime_int' must be comptime-known",
             .casted_to_comptime_float     => "value casted to 'comptime_float' must be comptime-known",
-            .panic_handler                => "panic handler must be comptime-known",
+            .std_builtin_decl             => "'std.builtin' declaration values must be comptime-known",
             // zig fmt: on
         };
     }
@@ -964,11 +986,14 @@ pub const EmitArtifact = enum {
     docs,
     pdb,
     h,
+    compiler_rt_dyn_lib,
 
     /// If using `Server` to communicate with the compiler, it will place requested artifacts in
     /// paths under the output directory, where those paths are named according to this function.
     /// Returned string is allocated with `gpa` and owned by the caller.
     pub fn cacheName(ea: EmitArtifact, gpa: Allocator, opts: BinNameOptions) Allocator.Error![]const u8 {
+        // hack for stage2_x86_64 + coff. See Coff.flush.
+        if (ea == .compiler_rt_dyn_lib) return "compiler_rt.dll";
         const suffix: []const u8 = switch (ea) {
             .bin => return binNameAlloc(gpa, opts),
             .@"asm" => ".s",
@@ -978,20 +1003,182 @@ pub const EmitArtifact = enum {
             .docs => "-docs",
             .pdb => ".pdb",
             .h => ".h",
+            .compiler_rt_dyn_lib => unreachable,
         };
         return std.fmt.allocPrint(gpa, "{s}{s}", .{ opts.root_name, suffix });
+    }
+};
+
+/// The defaults are chosen here to reduce the size of src/clang_options.zon
+pub const ClangCliParam = struct {
+    name: []const u8,
+    ze: ZigEquivalent = .other,
+    syntax: Syntax = .flag,
+    /// Prefixed by "-"
+    pd1: bool = true,
+    /// Prefixed by "--"
+    pd2: bool = false,
+    /// Prefixed by "/"
+    psl: bool = false,
+
+    pub const Syntax = union(enum) {
+        /// A flag with no values.
+        flag,
+        /// An option which prefixes its (single) value.
+        joined,
+        /// An option which is followed by its value.
+        separate,
+        /// An option which is either joined to its (non-empty) value, or followed by its value.
+        joined_or_separate,
+        /// An option which is both joined to its (first) value, and followed by its (second) value.
+        joined_and_separate,
+        /// An option followed by its values, which are separated by commas.
+        comma_joined,
+        /// An option which consumes an optional joined argument and any other remaining arguments.
+        remaining_args_joined,
+        /// An option which is which takes multiple (separate) arguments.
+        multi_arg: u8,
+    };
+
+    pub const ZigEquivalent = enum {
+        target,
+        o,
+        c,
+        r,
+        m,
+        x,
+        other,
+        positional,
+        l,
+        ignore,
+        driver_punt,
+        pic,
+        no_pic,
+        pie,
+        no_pie,
+        lto,
+        no_lto,
+        unwind_tables,
+        no_unwind_tables,
+        asynchronous_unwind_tables,
+        no_asynchronous_unwind_tables,
+        nostdlib,
+        nostdlib_cpp,
+        shared,
+        rdynamic,
+        wl,
+        wp,
+        preprocess_only,
+        asm_only,
+        optimize,
+        debug,
+        gdwarf32,
+        gdwarf64,
+        sanitize,
+        no_sanitize,
+        sanitize_trap,
+        no_sanitize_trap,
+        linker_script,
+        dry_run,
+        verbose,
+        for_linker,
+        linker_input_z,
+        lib_dir,
+        mcpu,
+        dep_file,
+        dep_file_to_stdout,
+        framework_dir,
+        framework,
+        nostdlibinc,
+        red_zone,
+        no_red_zone,
+        omit_frame_pointer,
+        no_omit_frame_pointer,
+        function_sections,
+        no_function_sections,
+        data_sections,
+        no_data_sections,
+        builtin,
+        no_builtin,
+        color_diagnostics,
+        no_color_diagnostics,
+        stack_check,
+        no_stack_check,
+        stack_protector,
+        no_stack_protector,
+        strip,
+        exec_model,
+        emit_llvm,
+        sysroot,
+        entry,
+        force_undefined_symbol,
+        weak_library,
+        weak_framework,
+        headerpad_max_install_names,
+        compress_debug_sections,
+        install_name,
+        undefined,
+        force_load_objc,
+        mingw_unicode_entry_point,
+        san_cov_trace_pc_guard,
+        san_cov,
+        no_san_cov,
+        rtlib,
+        static,
+        dynamic,
+        version,
+    };
+
+    pub fn matchEql(self: @This(), arg: []const u8) u2 {
+        if (self.pd1 and arg.len >= self.name.len + 1 and
+            mem.startsWith(u8, arg, "-") and mem.eql(u8, arg[1..], self.name))
+        {
+            return 1;
+        }
+        if (self.pd2 and arg.len >= self.name.len + 2 and
+            mem.startsWith(u8, arg, "--") and mem.eql(u8, arg[2..], self.name))
+        {
+            return 2;
+        }
+        if (self.psl and arg.len >= self.name.len + 1 and
+            mem.startsWith(u8, arg, "/") and mem.eql(u8, arg[1..], self.name))
+        {
+            return 1;
+        }
+        return 0;
+    }
+
+    pub fn matchStartsWith(self: @This(), arg: []const u8) usize {
+        if (self.pd1 and arg.len >= self.name.len + 1 and
+            mem.startsWith(u8, arg, "-") and mem.startsWith(u8, arg[1..], self.name))
+        {
+            return self.name.len + 1;
+        }
+        if (self.pd2 and arg.len >= self.name.len + 2 and
+            mem.startsWith(u8, arg, "--") and mem.startsWith(u8, arg[2..], self.name))
+        {
+            return self.name.len + 2;
+        }
+        if (self.psl and arg.len >= self.name.len + 1 and
+            mem.startsWith(u8, arg, "/") and mem.startsWith(u8, arg[1..], self.name))
+        {
+            return self.name.len + 1;
+        }
+        return 0;
     }
 };
 
 test {
     _ = Ast;
     _ = AstRlAnnotate;
+    _ = AstSmith;
     _ = BuiltinFn;
     _ = Client;
     _ = ErrorBundle;
     _ = LibCDirs;
     _ = LibCInstallation;
     _ = Server;
+    _ = TokenSmith;
     _ = WindowsSdk;
     _ = number_literal;
     _ = primitives;

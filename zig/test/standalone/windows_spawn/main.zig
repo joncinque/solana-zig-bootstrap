@@ -8,9 +8,7 @@ const utf16Literal = std.unicode.utf8ToUtf16LeStringLiteral;
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
     const io = init.io;
-    const process_cwd_path = try std.process.getCwdAlloc(init.arena.allocator());
-    var initial_process_cwd = try Io.Dir.cwd().openDir(io, ".", .{});
-    defer initial_process_cwd.close(io);
+    const process_cwd_path = try std.process.currentPathAlloc(io, init.arena.allocator());
 
     var it = try init.minimal.args.iterateAllocator(gpa);
     defer it.deinit();
@@ -31,16 +29,10 @@ pub fn main(init: std.process.Init) !void {
     defer gpa.free(tmp_relative_path);
 
     // Clear PATH
-    std.debug.assert(windows.kernel32.SetEnvironmentVariableW(
-        utf16Literal("PATH"),
-        null,
-    ) == windows.TRUE);
+    std.debug.assert(SetEnvironmentVariableW(utf16Literal("PATH"), null).toBool());
 
     // Set PATHEXT to something predictable
-    std.debug.assert(windows.kernel32.SetEnvironmentVariableW(
-        utf16Literal("PATHEXT"),
-        utf16Literal(".COM;.EXE;.BAT;.CMD;.JS"),
-    ) == windows.TRUE);
+    std.debug.assert(SetEnvironmentVariableW(utf16Literal("PATHEXT"), utf16Literal(".COM;.EXE;.BAT;.CMD;.JS")).toBool());
 
     // No PATH, so it should fail to find anything not in the cwd
     try testExecError(error.FileNotFound, gpa, io, "something_missing");
@@ -48,10 +40,7 @@ pub fn main(init: std.process.Init) !void {
     // make sure we don't get error.BadPath traversing out of cwd with a relative path
     try testExecError(error.FileNotFound, gpa, io, "..\\.\\.\\.\\\\..\\more_missing");
 
-    std.debug.assert(windows.kernel32.SetEnvironmentVariableW(
-        utf16Literal("PATH"),
-        tmp_absolute_path_w,
-    ) == windows.TRUE);
+    std.debug.assert(SetEnvironmentVariableW(utf16Literal("PATH"), tmp_absolute_path_w).toBool());
 
     // Move hello.exe into the tmp dir which is now added to the path
     try Io.Dir.cwd().copyFile(hello_exe_cache_path, tmp_dir, "hello.exe", io, .{});
@@ -127,14 +116,11 @@ pub fn main(init: std.process.Init) !void {
 
     // Now let's set the tmp dir as the cwd and set the path only include the "something" sub dir
     try std.process.setCurrentDir(io, tmp_dir);
-    defer std.process.setCurrentDir(io, initial_process_cwd) catch {};
+    defer std.process.setCurrentPath(io, process_cwd_path) catch {};
     const something_subdir_abs_path = try std.mem.concatWithSentinel(gpa, u16, &.{ tmp_absolute_path_w, utf16Literal("\\something") }, 0);
     defer gpa.free(something_subdir_abs_path);
 
-    std.debug.assert(windows.kernel32.SetEnvironmentVariableW(
-        utf16Literal("PATH"),
-        something_subdir_abs_path,
-    ) == windows.TRUE);
+    std.debug.assert(SetEnvironmentVariableW(utf16Literal("PATH"), something_subdir_abs_path).toBool());
 
     // Now trying to execute goodbye should give error.InvalidExe since it's the original
     // error that we got when trying within the cwd
@@ -171,18 +157,12 @@ pub fn main(init: std.process.Init) !void {
     defer gpa.free(denormed_something_subdir_wtf8);
 
     // clear the path to ensure that the match comes from the cwd
-    std.debug.assert(windows.kernel32.SetEnvironmentVariableW(
-        utf16Literal("PATH"),
-        null,
-    ) == windows.TRUE);
+    std.debug.assert(SetEnvironmentVariableW(utf16Literal("PATH"), null).toBool());
 
     try testExecWithCwd(gpa, io, "goodbye", denormed_something_subdir_wtf8, "hello from exe\n");
 
     // normalization should also work if the non-normalized path is found in the PATH var.
-    std.debug.assert(windows.kernel32.SetEnvironmentVariableW(
-        utf16Literal("PATH"),
-        denormed_something_subdir_abs_path,
-    ) == windows.TRUE);
+    std.debug.assert(SetEnvironmentVariableW(utf16Literal("PATH"), denormed_something_subdir_abs_path).toBool());
     try testExec(gpa, io, "goodbye", "hello from exe\n");
 
     // now make sure we can launch executables "outside" of the cwd
@@ -193,10 +173,7 @@ pub fn main(init: std.process.Init) !void {
     try std.process.setCurrentDir(io, subdir_cwd);
 
     // clear the PATH again
-    std.debug.assert(windows.kernel32.SetEnvironmentVariableW(
-        utf16Literal("PATH"),
-        null,
-    ) == windows.TRUE);
+    std.debug.assert(SetEnvironmentVariableW(utf16Literal("PATH"), null).toBool());
 
     // while we're at it make sure non-windows separators work fine
     try testExec(gpa, io, "../hello", "hello from exe\n");
@@ -207,10 +184,20 @@ fn testExecError(err: anyerror, gpa: Allocator, io: Io, command: []const u8) !vo
 }
 
 fn testExec(gpa: Allocator, io: Io, command: []const u8, expected_stdout: []const u8) !void {
-    return testExecWithCwd(gpa, io, command, null, expected_stdout);
+    return testExecWithCwdInner(gpa, io, command, .inherit, expected_stdout);
 }
 
-fn testExecWithCwd(gpa: Allocator, io: Io, command: []const u8, cwd: ?[]const u8, expected_stdout: []const u8) !void {
+fn testExecWithCwd(gpa: Allocator, io: Io, command: []const u8, cwd: []const u8, expected_stdout: []const u8) !void {
+    // Test by passing CWD as both a path and a Dir
+    try testExecWithCwdInner(gpa, io, command, .{ .path = cwd }, expected_stdout);
+
+    var cwd_dir = try Io.Dir.cwd().openDir(io, cwd, .{});
+    defer cwd_dir.close(io);
+
+    try testExecWithCwdInner(gpa, io, command, .{ .dir = cwd_dir }, expected_stdout);
+}
+
+fn testExecWithCwdInner(gpa: Allocator, io: Io, command: []const u8, cwd: std.process.Child.Cwd, expected_stdout: []const u8) !void {
     const result = try std.process.run(gpa, io, .{
         .argv = &[_][]const u8{command},
         .cwd = cwd,
@@ -223,15 +210,21 @@ fn testExecWithCwd(gpa: Allocator, io: Io, command: []const u8, cwd: ?[]const u8
 }
 
 fn renameExe(dir: Io.Dir, io: Io, old_sub_path: []const u8, new_sub_path: []const u8) !void {
-    var attempt: u5 = 0;
+    var attempt: u5 = 10;
     while (true) break dir.rename(old_sub_path, dir, new_sub_path, io) catch |err| switch (err) {
         error.AccessDenied => {
-            if (attempt == 13) return error.AccessDenied;
+            if (attempt == 26) return error.AccessDenied;
             // give the kernel a chance to finish closing the executable handle
-            _ = std.os.windows.kernel32.SleepEx(@as(u32, 1) << attempt >> 1, std.os.windows.FALSE);
+            const interval = @as(std.os.windows.LARGE_INTEGER, -1) << attempt;
+            _ = std.os.windows.ntdll.NtDelayExecution(.FALSE, &interval);
             attempt += 1;
             continue;
         },
         else => |e| return e,
     };
 }
+
+pub extern "kernel32" fn SetEnvironmentVariableW(
+    lpName: windows.LPCWSTR,
+    lpValue: ?windows.LPCWSTR,
+) callconv(.winapi) windows.BOOL;

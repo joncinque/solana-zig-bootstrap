@@ -29,6 +29,9 @@ __clone:
 	p0 = cmp.eq(r0, #0)
 	if (!p0) dealloc_return
 
+	{ r30 = #0
+	  r31 = #0 }
+
 	{ r0 = r10
 	  callr r11 }
 

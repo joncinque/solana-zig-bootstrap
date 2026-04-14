@@ -1,5 +1,5 @@
 /* Prototype declarations for math functions; helper file for <math.h>.
-   Copyright (C) 1996-2025 Free Software Foundation, Inc.
+   Copyright (C) 1996-2026 Free Software Foundation, Inc.
    This file is part of the GNU C Library.
 
    The GNU C Library is free software; you can redistribute it and/or
@@ -136,16 +136,16 @@ __MATHCALL (modf,, (_Mdouble_ __x, _Mdouble_ *__iptr)) __nonnull ((2));
 __MATHCALL_VEC (exp10,, (_Mdouble_ __x));
 
 /* Return exp2(X) - 1.  */
-__MATHCALL (exp2m1,, (_Mdouble_ __x));
+__MATHCALL_VEC (exp2m1,, (_Mdouble_ __x));
 
 /* Return exp10(X) - 1.  */
-__MATHCALL (exp10m1,, (_Mdouble_ __x));
+__MATHCALL_VEC (exp10m1,, (_Mdouble_ __x));
 
 /* Return log2(1 + X).  */
-__MATHCALL (log2p1,, (_Mdouble_ __x));
+__MATHCALL_VEC (log2p1,, (_Mdouble_ __x));
 
 /* Return log10(1 + X).  */
-__MATHCALL (log10p1,, (_Mdouble_ __x));
+__MATHCALL_VEC (log10p1,, (_Mdouble_ __x));
 
 /* Return log(1 + X).  */
 __MATHCALL_VEC (logp1,, (_Mdouble_ __x));
@@ -203,7 +203,7 @@ __MATHCALL (powr,, (_Mdouble_ __x, _Mdouble_ __y));
 __MATHCALL (rootn,, (_Mdouble_ __x, long long int __y));
 
 /* Return the reciprocal of the square root of X.  */
-__MATHCALL (rsqrt,, (_Mdouble_ __x));
+__MATHCALL_VEC (rsqrt,, (_Mdouble_ __x));
 #endif
 
 
@@ -400,25 +400,21 @@ __MATHCALLX (roundeven,, (_Mdouble_ __x), (__const__));
 
 /* Round X to nearest signed integer value, not raising inexact, with
    control of rounding direction and width of result.  */
-__MATHDECL (__intmax_t, fromfp,, (_Mdouble_ __x, int __round,
-				  unsigned int __width));
+__MATHCALL (fromfp,, (_Mdouble_ __x, int __round, unsigned int __width));
 
 /* Round X to nearest unsigned integer value, not raising inexact,
    with control of rounding direction and width of result.  */
-__MATHDECL (__uintmax_t, ufromfp,, (_Mdouble_ __x, int __round,
-				    unsigned int __width));
+__MATHCALL (ufromfp,, (_Mdouble_ __x, int __round, unsigned int __width));
 
 /* Round X to nearest signed integer value, raising inexact for
    non-integers, with control of rounding direction and width of
    result.  */
-__MATHDECL (__intmax_t, fromfpx,, (_Mdouble_ __x, int __round,
-				   unsigned int __width));
+__MATHCALL (fromfpx,, (_Mdouble_ __x, int __round, unsigned int __width));
 
 /* Round X to nearest unsigned integer value, raising inexact for
    non-integers, with control of rounding direction and width of
    result.  */
-__MATHDECL (__uintmax_t, ufromfpx,, (_Mdouble_ __x, int __round,
-				     unsigned int __width));
+__MATHCALL (ufromfpx,, (_Mdouble_ __x, int __round, unsigned int __width));
 
 /* Canonicalize floating-point representation.  */
 __MATHDECL_1 (int, canonicalize,, (_Mdouble_ *__cx, const _Mdouble_ *__x));

@@ -28,11 +28,12 @@ fn logImpl(
 }
 
 pub fn main(init: std.process.Init) !void {
+    const gpa = init.gpa;
     const fatal = std.process.fatal;
     const arena = init.arena.allocator();
     const io = init.io;
     const environ_map = init.environ_map;
-    const cwd_path = try std.process.getCwdAlloc(arena);
+    const cwd_path = try std.process.currentPathAlloc(io, arena);
 
     var opt_zig_exe: ?[]const u8 = null;
     var opt_input_file_name: ?[]const u8 = null;
@@ -147,7 +148,6 @@ pub fn main(init: std.process.Init) !void {
             "--global-cache-dir",
             ".global-cache",
         });
-        if (target.resolved.os.tag == .windows) try child_args.append(arena, "-lws2_32");
         try child_args.append(arena, "--listen=-");
 
         if (opt_resolved_lib_dir) |resolved_lib_dir| {
@@ -189,9 +189,6 @@ pub fn main(init: std.process.Init) !void {
                 opt_resolved_lib_dir.?, // verified earlier
             });
 
-            if (target.resolved.os.tag == .windows)
-                try cc_child_args.append(arena, "-lws2_32");
-
             try cc_child_args.append(arena, "-o");
         }
 
@@ -201,8 +198,7 @@ pub fn main(init: std.process.Init) !void {
             .stdout = .pipe,
             .stderr = .pipe,
             .progress_node = zig_prog_node,
-            .cwd_dir = tmp_dir,
-            .cwd = tmp_dir_path,
+            .cwd = .{ .path = tmp_dir_path },
         });
         defer child.kill(io);
 
@@ -224,11 +220,10 @@ pub fn main(init: std.process.Init) !void {
             .enable_darling = enable_darling,
         };
 
-        var poller = Io.poll(arena, Eval.StreamEnum, .{
-            .stdout = child.stdout.?,
-            .stderr = child.stderr.?,
-        });
-        defer poller.deinit();
+        var multi_reader_buffer: Io.File.MultiReader.Buffer(2) = undefined;
+        var multi_reader: Io.File.MultiReader = undefined;
+        multi_reader.init(gpa, io, multi_reader_buffer.toStreams(), &.{ child.stdout.?, child.stderr.? });
+        defer multi_reader.deinit();
 
         for (case.updates) |update| {
             var update_node = target_prog_node.start(update.name, 0);
@@ -243,10 +238,10 @@ pub fn main(init: std.process.Init) !void {
 
             eval.write(update);
             try eval.requestUpdate();
-            try eval.check(&poller, update, update_node);
+            try eval.check(&multi_reader, update, update_node);
         }
 
-        try eval.end(&poller);
+        try eval.end(&multi_reader);
 
         waitChild(&child, &eval);
     }
@@ -272,9 +267,6 @@ const Eval = struct {
     enable_wasmtime: bool,
     enable_darling: bool,
 
-    const StreamEnum = enum { stdout, stderr };
-    const Poller = Io.Poller(StreamEnum);
-
     /// Currently this function assumes the previous updates have already been written.
     fn write(eval: *Eval, update: Case.Update) void {
         const io = eval.io;
@@ -293,28 +285,34 @@ const Eval = struct {
         }
     }
 
-    fn check(eval: *Eval, poller: *Poller, update: Case.Update, prog_node: std.Progress.Node) !void {
+    fn check(eval: *Eval, mr: *Io.File.MultiReader, update: Case.Update, prog_node: std.Progress.Node) !void {
         const arena = eval.arena;
-        const stdout = poller.reader(.stdout);
-        const stderr = poller.reader(.stderr);
+        const stdout = mr.fileReader(0);
+        const stderr = &mr.fileReader(1).interface;
+        const Header = std.zig.Server.Message.Header;
 
-        poll: while (true) {
-            const Header = std.zig.Server.Message.Header;
-            while (stdout.buffered().len < @sizeOf(Header)) if (!try poller.poll()) break :poll;
-            const header = stdout.takeStruct(Header, .little) catch unreachable;
-            while (stdout.buffered().len < header.bytes_len) if (!try poller.poll()) break :poll;
-            const body = stdout.take(header.bytes_len) catch unreachable;
+        while (true) {
+            const header = stdout.interface.takeStruct(Header, .little) catch |err| switch (err) {
+                error.EndOfStream => break,
+                error.ReadFailed => return stdout.err.?,
+            };
+            const body = stdout.interface.take(header.bytes_len) catch |err| switch (err) {
+                // If this panic triggers it might be helpful to rework this
+                // code to print the stderr from the abnormally terminated child.
+                error.EndOfStream => @panic("unexpected mid-message end of stream"),
+                error.ReadFailed => return stdout.err.?,
+            };
 
             switch (header.tag) {
                 .error_bundle => {
                     const result_error_bundle = try std.zig.Server.allocErrorBundle(arena, body);
                     if (stderr.bufferedLen() > 0) {
-                        const stderr_data = try poller.toOwnedSlice(.stderr);
                         if (eval.allow_stderr) {
-                            std.log.info("error_bundle stderr:\n{s}", .{stderr_data});
+                            std.log.info("error_bundle stderr:\n{s}", .{stderr.buffered()});
                         } else {
-                            eval.fatal("error_bundle unexpected stderr:\n{s}", .{stderr_data});
+                            eval.fatal("error_bundle unexpected stderr:\n{s}", .{stderr.buffered()});
                         }
+                        stderr.tossBuffered();
                     }
                     if (result_error_bundle.errorMessageCount() != 0) {
                         try eval.checkErrorOutcome(update, result_error_bundle);
@@ -325,18 +323,18 @@ const Eval = struct {
                 .emit_digest => {
                     var r: std.Io.Reader = .fixed(body);
                     _ = r.takeStruct(std.zig.Server.Message.EmitDigest, .little) catch unreachable;
-                    if (stderr.bufferedLen() > 0) {
-                        const stderr_data = try poller.toOwnedSlice(.stderr);
-                        if (eval.allow_stderr) {
-                            std.log.info("emit_digest stderr:\n{s}", .{stderr_data});
-                        } else {
-                            eval.fatal("emit_digest unexpected stderr:\n{s}", .{stderr_data});
-                        }
-                    }
 
+                    if (stderr.bufferedLen() > 0) {
+                        if (eval.allow_stderr) {
+                            std.log.info("emit_digest stderr:\n{s}", .{stderr.buffered()});
+                        } else {
+                            eval.fatal("emit_digest unexpected stderr:\n{s}", .{stderr.buffered()});
+                        }
+                        stderr.tossBuffered();
+                    }
                     if (eval.target.backend == .sema) {
                         try eval.checkSuccessOutcome(update, null, prog_node);
-                        // This message indicates the end of the update.
+                        continue;
                     }
 
                     const digest = r.takeArray(Cache.bin_digest_len) catch unreachable;
@@ -350,7 +348,6 @@ const Eval = struct {
                     const bin_path = try Dir.path.join(arena, &.{ result_dir, bin_name });
 
                     try eval.checkSuccessOutcome(update, bin_path, prog_node);
-                    // This message indicates the end of the update.
                 },
                 else => {
                     // Ignore other messages.
@@ -358,16 +355,17 @@ const Eval = struct {
             }
         }
 
-        if (stderr.bufferedLen() > 0) {
+        const buffered_stderr = stderr.buffered();
+        if (buffered_stderr.len > 0) {
             if (eval.allow_stderr) {
-                std.log.info("stderr:\n{s}", .{stderr.buffered()});
+                std.log.info("stderr:\n{s}", .{buffered_stderr});
             } else {
-                eval.fatal("unexpected stderr:\n{s}", .{stderr.buffered()});
+                eval.fatal("unexpected stderr:\n{s}", .{buffered_stderr});
             }
         }
 
         waitChild(eval.child, eval);
-        eval.fatal("compiler failed to send error_bundle or emit_bin_path", .{});
+        eval.fatal("compiler failed to send terminating error_bundle", .{});
     }
 
     fn checkErrorOutcome(eval: *Eval, update: Case.Update, error_bundle: std.zig.ErrorBundle) !void {
@@ -414,29 +412,32 @@ const Eval = struct {
         is_note: bool,
         err_idx: std.zig.ErrorBundle.MessageIndex,
     ) Allocator.Error!void {
+        const io = eval.io;
         const err = eb.getErrorMessage(err_idx);
-        if (err.src_loc == .none) @panic("TODO error message with no source location");
         if (err.count != 1) @panic("TODO error message with count>1");
         const msg = eb.nullTerminatedString(err.msg);
-        const src = eb.getSourceLocation(err.src_loc);
-        const raw_filename = eb.nullTerminatedString(src.src_path);
-
-        const io = eval.io;
-
-        // We need to replace backslashes for consistency between platforms.
-        const filename = name: {
-            if (std.mem.indexOfScalar(u8, raw_filename, '\\') == null) break :name raw_filename;
-            const copied = try eval.arena.dupe(u8, raw_filename);
-            std.mem.replaceScalar(u8, copied, '\\', '/');
-            break :name copied;
+        const matches = matches: {
+            if (expected.is_note != is_note) break :matches false;
+            if (!std.mem.eql(u8, expected.msg, msg)) break :matches false;
+            if (err.src_loc == .none) {
+                break :matches expected.src == null;
+            }
+            const expected_src = expected.src orelse break :matches false;
+            const src = eb.getSourceLocation(err.src_loc);
+            const raw_filename = eb.nullTerminatedString(src.src_path);
+            // We need to replace backslashes for consistency between platforms.
+            const filename = name: {
+                if (std.mem.indexOfScalar(u8, raw_filename, '\\') == null) break :name raw_filename;
+                const copied = try eval.arena.dupe(u8, raw_filename);
+                std.mem.replaceScalar(u8, copied, '\\', '/');
+                break :name copied;
+            };
+            if (!std.mem.eql(u8, expected_src.filename, filename)) break :matches false;
+            if (expected_src.line != src.line + 1) break :matches false;
+            if (expected_src.column != src.column + 1) break :matches false;
+            break :matches true;
         };
-
-        if (expected.is_note != is_note or
-            !std.mem.eql(u8, expected.filename, filename) or
-            expected.line != src.line + 1 or
-            expected.column != src.column + 1 or
-            !std.mem.eql(u8, expected.msg, msg))
-        {
+        if (!matches) {
             eb.renderToStderr(io, .{}, .auto) catch {};
             eval.fatal("compile error did not match expected error", .{});
         }
@@ -529,8 +530,7 @@ const Eval = struct {
 
         const result = std.process.run(eval.arena, io, .{
             .argv = argv,
-            .cwd_dir = eval.tmp_dir,
-            .cwd = eval.tmp_dir_path,
+            .cwd = .{ .path = eval.tmp_dir_path },
         }) catch |err| {
             if (is_foreign) {
                 // Chances are the foreign executor isn't available. Skip this evaluation.
@@ -568,7 +568,10 @@ const Eval = struct {
             .signal => |sig| {
                 eval.fatal("generated executable '{s}' terminated with signal {t}", .{ binary_path, sig });
             },
-            .stopped, .unknown => {
+            .stopped => |sig| {
+                eval.fatal("generated executable '{s}' stopped with signal {t}", .{ binary_path, sig });
+            },
+            .unknown => {
                 eval.fatal("generated executable '{s}' terminated unexpectedly", .{binary_path});
             },
         }
@@ -588,23 +591,27 @@ const Eval = struct {
         };
     }
 
-    fn end(eval: *Eval, poller: *Poller) !void {
+    fn end(eval: *Eval, mr: *Io.File.MultiReader) !void {
         requestExit(eval.child, eval);
 
-        const stdout = poller.reader(.stdout);
-        const stderr = poller.reader(.stderr);
+        const stdout = mr.fileReader(0);
+        const Header = std.zig.Server.Message.Header;
 
-        poll: while (true) {
-            const Header = std.zig.Server.Message.Header;
-            while (stdout.buffered().len < @sizeOf(Header)) if (!try poller.poll()) break :poll;
-            const header = stdout.takeStruct(Header, .little) catch unreachable;
-            while (stdout.buffered().len < header.bytes_len) if (!try poller.poll()) break :poll;
-            stdout.toss(header.bytes_len);
+        while (true) {
+            const header = stdout.interface.takeStruct(Header, .little) catch |err| switch (err) {
+                error.EndOfStream => break,
+                error.ReadFailed => return stdout.err.?,
+            };
+            stdout.interface.discardAll(header.bytes_len) catch |err| switch (err) {
+                error.ReadFailed => return stdout.err.?,
+                error.EndOfStream => |e| return e,
+            };
         }
 
-        if (stderr.bufferedLen() > 0) {
-            eval.fatal("unexpected stderr:\n{s}", .{stderr.buffered()});
-        }
+        try mr.fillRemaining(.none);
+
+        const stderr = mr.reader(1).buffered();
+        if (stderr.len > 0) eval.fatal("unexpected stderr:\n{s}", .{stderr});
     }
 
     fn buildCOutput(eval: *Eval, c_path: []const u8, out_path: []const u8, prog_node: std.Progress.Node) !void {
@@ -618,25 +625,22 @@ const Eval = struct {
 
         const result = std.process.run(eval.arena, eval.io, .{
             .argv = eval.cc_child_args.items,
-            .cwd_dir = eval.tmp_dir,
-            .cwd = eval.tmp_dir_path,
+            .cwd = .{ .path = eval.tmp_dir_path },
             .progress_node = child_prog_node,
         }) catch |err| {
             eval.fatal("failed to spawn zig cc for '{s}': {t}", .{ c_path, err });
         };
+
+        if (result.term == .exited and result.term.exited == 0) return;
+
+        if (result.stderr.len != 0) {
+            std.log.err("zig cc stderr:\n{s}", .{result.stderr});
+        }
         switch (result.term) {
-            .exited => |code| if (code != 0) {
-                if (result.stderr.len != 0) {
-                    std.log.err("zig cc stderr:\n{s}", .{result.stderr});
-                }
-                eval.fatal("zig cc for '{s}' failed with code {d}", .{ c_path, code });
-            },
-            .signal, .stopped, .unknown => {
-                if (result.stderr.len != 0) {
-                    std.log.err("zig cc stderr:\n{s}", .{result.stderr});
-                }
-                eval.fatal("zig cc for '{s}' terminated unexpectedly", .{c_path});
-            },
+            .exited => |code| eval.fatal("zig cc for '{s}' failed with code {d}", .{ c_path, code }),
+            .signal => |sig| eval.fatal("zig cc for '{s}' terminated unexpectedly with signal {t}", .{ c_path, sig }),
+            .stopped => |sig| eval.fatal("zig cc for '{s}' stopped unexpectedly with signal {t}", .{ c_path, sig }),
+            .unknown => eval.fatal("zig cc for '{s}' terminated unexpectedly", .{c_path}),
         }
     }
 
@@ -709,10 +713,12 @@ const Case = struct {
 
     const ExpectedError = struct {
         is_note: bool,
-        filename: []const u8,
-        line: u32,
-        column: u32,
         msg: []const u8,
+        src: ?struct {
+            filename: []const u8,
+            line: u32,
+            column: u32,
+        },
     };
 
     fn parse(arena: Allocator, io: Io, bytes: []const u8) !Case {
@@ -913,7 +919,8 @@ fn waitChild(child: *std.process.Child, eval: *Eval) void {
     switch (term) {
         .exited => |code| if (code != 0) eval.fatal("compiler failed with code {d}", .{code}),
         .signal => |sig| eval.fatal("compiler terminated with signal {t}", .{sig}),
-        .stopped, .unknown => eval.fatal("compiler terminated unexpectedly", .{}),
+        .stopped => |sig| eval.fatal("compiler stopped unexpectedly with signal {t}", .{sig}),
+        .unknown => eval.fatal("compiler terminated unexpectedly", .{}),
     }
 }
 
@@ -925,16 +932,16 @@ fn parseExpectedError(str: []const u8, l: usize) Case.ExpectedError {
 
     var it = std.mem.splitScalar(u8, str, ':');
     const filename = it.first();
-    const line_str = it.next() orelse fatal("line {d}: incomplete error specification", .{l});
-    const column_str = it.next() orelse fatal("line {d}: incomplete error specification", .{l});
+    const line_str, const column_str = if (filename.len > 0) .{
+        it.next() orelse fatal("line {d}: incomplete error specification", .{l}),
+        it.next() orelse fatal("line {d}: incomplete error specification", .{l}),
+    } else .{ undefined, undefined };
     const error_or_note_str = std.mem.trim(
         u8,
         it.next() orelse fatal("line {d}: incomplete error specification", .{l}),
         " ",
     );
-    const message = std.mem.trim(u8, it.rest(), " ");
-    if (filename.len == 0) fatal("line {d}: empty filename", .{l});
-    if (message.len == 0) fatal("line {d}: empty error message", .{l});
+
     const is_note = if (std.mem.eql(u8, error_or_note_str, "error"))
         false
     else if (std.mem.eql(u8, error_or_note_str, "note"))
@@ -942,18 +949,19 @@ fn parseExpectedError(str: []const u8, l: usize) Case.ExpectedError {
     else
         fatal("line {d}: expeted 'error' or 'note', found '{s}'", .{ l, error_or_note_str });
 
-    const line = std.fmt.parseInt(u32, line_str, 10) catch
-        fatal("line {d}: invalid line number '{s}'", .{ l, line_str });
-
-    const column = std.fmt.parseInt(u32, column_str, 10) catch
-        fatal("line {d}: invalid column number '{s}'", .{ l, column_str });
+    const message = std.mem.trim(u8, it.rest(), " ");
+    if (message.len == 0) fatal("line {d}: empty error message", .{l});
 
     return .{
         .is_note = is_note,
-        .filename = filename,
-        .line = line,
-        .column = column,
         .msg = message,
+        .src = if (filename.len == 0) null else .{
+            .filename = filename,
+            .line = std.fmt.parseInt(u32, line_str, 10) catch
+                fatal("line {d}: invalid line number '{s}'", .{ l, line_str }),
+            .column = std.fmt.parseInt(u32, column_str, 10) catch
+                fatal("line {d}: invalid column number '{s}'", .{ l, column_str }),
+        },
     };
 }
 

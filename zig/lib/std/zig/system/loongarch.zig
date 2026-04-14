@@ -1,6 +1,16 @@
 const builtin = @import("builtin");
 const std = @import("std");
 
+inline fn bit(input: u32, offset: u5) bool {
+    return (input >> offset) & 1 != 0;
+}
+
+fn setFeature(cpu: *std.Target.Cpu, feature: std.Target.loongarch.Feature, enabled: bool) void {
+    const idx = @as(std.Target.Cpu.Feature.Set.Index, @intFromEnum(feature));
+
+    if (enabled) cpu.features.addFeature(idx) else cpu.features.removeFeature(idx);
+}
+
 pub fn detectNativeCpuAndFeatures(
     arch: std.Target.Cpu.Arch,
     os: std.Target.Os,
@@ -9,9 +19,6 @@ pub fn detectNativeCpuAndFeatures(
     _ = os;
     _ = query;
 
-    // Clearly this code could do better in the future by actually querying specific CPU features
-    // with the cpucfg instruction like on x86. But with the small number of well-known LoongArch
-    // models that exist at the moment, simply checking the PRID is plenty.
     var cpu: std.Target.Cpu = .{
         .arch = arch,
         .model = switch (cpucfg(0) & 0xf000) {
@@ -23,6 +30,31 @@ pub fn detectNativeCpuAndFeatures(
     };
 
     cpu.features.addFeatureSet(cpu.model.features);
+
+    const cfg1 = cpucfg(1);
+    const cfg2 = cpucfg(2);
+    const cfg3 = cpucfg(3);
+
+    setFeature(&cpu, .ual, bit(cfg1, 20));
+
+    const has_fpu = bit(cfg2, 0);
+    setFeature(&cpu, .f, has_fpu and bit(cfg2, 1));
+    setFeature(&cpu, .d, has_fpu and bit(cfg2, 2));
+
+    setFeature(&cpu, .lsx, bit(cfg2, 6));
+    setFeature(&cpu, .lasx, bit(cfg2, 7));
+    setFeature(&cpu, .lvz, bit(cfg2, 10));
+
+    setFeature(&cpu, .lbt, bit(cfg2, 18) and bit(cfg2, 19) and bit(cfg2, 20));
+
+    setFeature(&cpu, .frecipe, bit(cfg2, 25));
+    setFeature(&cpu, .div32, bit(cfg2, 26));
+    setFeature(&cpu, .lam_bh, bit(cfg2, 27));
+    setFeature(&cpu, .lamcas, bit(cfg2, 28));
+    setFeature(&cpu, .scq, bit(cfg2, 30));
+
+    setFeature(&cpu, .ld_seq_sa, bit(cfg3, 23));
+
     cpu.features.populateDependencies(cpu.arch.allFeaturesList());
 
     return cpu;

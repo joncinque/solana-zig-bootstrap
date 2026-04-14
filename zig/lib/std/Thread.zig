@@ -1,6 +1,5 @@
-//! This struct represents a kernel thread, and acts as a namespace for
-//! concurrency primitives that operate on kernel threads. For concurrency
-//! primitives that interact with the I/O interface, see `std.Io`.
+//! This struct represents a kernel thread.
+const Thread = @This();
 
 const builtin = @import("builtin");
 const target = builtin.target;
@@ -14,135 +13,8 @@ const posix = std.posix;
 const windows = std.os.windows;
 const testing = std.testing;
 
-pub const Futex = @import("Thread/Futex.zig");
-pub const Mutex = @import("Thread/Mutex.zig");
-pub const Semaphore = @import("Thread/Semaphore.zig");
-pub const Condition = @import("Thread/Condition.zig");
-pub const RwLock = @import("Thread/RwLock.zig");
-pub const WaitGroup = @import("Thread/WaitGroup.zig");
-
-pub const Pool = @compileError("deprecated; consider using 'std.Io.Group' with 'std.Io.Threaded'");
-
 pub const use_pthreads = native_os != .windows and native_os != .wasi and builtin.link_libc;
 
-/// A thread-safe logical boolean value which can be `set` and `unset`.
-///
-/// It can also block threads until the value is set with cancelation via timed
-/// waits. Statically initializable; four bytes on all targets.
-pub const ResetEvent = enum(u32) {
-    unset = 0,
-    waiting = 1,
-    is_set = 2,
-
-    /// Returns whether the logical boolean is `set`.
-    ///
-    /// Once `reset` is called, this returns false until the next `set`.
-    ///
-    /// The memory accesses before the `set` can be said to happen before
-    /// `isSet` returns true.
-    pub fn isSet(re: *const ResetEvent) bool {
-        if (builtin.single_threaded) return switch (re.*) {
-            .unset => false,
-            .waiting => unreachable,
-            .is_set => true,
-        };
-        // Acquire barrier ensures memory accesses before `set` happen before
-        // returning true.
-        return @atomicLoad(ResetEvent, re, .acquire) == .is_set;
-    }
-
-    /// Blocks the calling thread until `set` is called.
-    ///
-    /// This is effectively a more efficient version of `while (!isSet()) {}`.
-    ///
-    /// The memory accesses before the `set` can be said to happen before `wait` returns.
-    pub fn wait(re: *ResetEvent) void {
-        if (builtin.single_threaded) switch (re.*) {
-            .unset => unreachable, // Deadlock, no other threads to wake us up.
-            .waiting => unreachable, // Invalid state.
-            .is_set => return,
-        };
-        if (!re.isSet()) return timedWaitInner(re, null) catch |err| switch (err) {
-            error.Timeout => unreachable, // No timeout specified.
-        };
-    }
-
-    /// Blocks the calling thread until `set` is called, or until the
-    /// corresponding timeout expires, returning `error.Timeout`.
-    ///
-    /// This is effectively a more efficient version of `while (!isSet()) {}`.
-    ///
-    /// The memory accesses before the set() can be said to happen before
-    /// timedWait() returns without error.
-    pub fn timedWait(re: *ResetEvent, timeout_ns: u64) error{Timeout}!void {
-        if (builtin.single_threaded) switch (re.*) {
-            .unset => return error.Timeout,
-            .waiting => unreachable, // Invalid state.
-            .is_set => return,
-        };
-        if (!re.isSet()) return timedWaitInner(re, timeout_ns);
-    }
-
-    fn timedWaitInner(re: *ResetEvent, timeout: ?u64) error{Timeout}!void {
-        @branchHint(.cold);
-
-        // Try to set the state from `unset` to `waiting` to indicate to the
-        // `set` thread that others are blocked on the ResetEvent. Avoid using
-        // any strict barriers until we know the ResetEvent is set.
-        var state = @atomicLoad(ResetEvent, re, .acquire);
-        if (state == .unset) {
-            state = @cmpxchgStrong(ResetEvent, re, state, .waiting, .acquire, .acquire) orelse .waiting;
-        }
-
-        // Wait until the ResetEvent is set since the state is waiting.
-        if (state == .waiting) {
-            var futex_deadline = Futex.Deadline.init(timeout);
-            while (true) {
-                const wait_result = futex_deadline.wait(@ptrCast(re), @intFromEnum(ResetEvent.waiting));
-
-                // Check if the ResetEvent was set before possibly reporting error.Timeout below.
-                state = @atomicLoad(ResetEvent, re, .acquire);
-                if (state != .waiting) break;
-
-                try wait_result;
-            }
-        }
-
-        assert(state == .is_set);
-    }
-
-    /// Marks the logical boolean as `set` and unblocks any threads in `wait`
-    /// or `timedWait` to observe the new state.
-    ///
-    /// The logical boolean stays `set` until `reset` is called, making future
-    /// `set` calls do nothing semantically.
-    ///
-    /// The memory accesses before `set` can be said to happen before `isSet`
-    /// returns true or `wait`/`timedWait` return successfully.
-    pub fn set(re: *ResetEvent) void {
-        if (builtin.single_threaded) {
-            re.* = .is_set;
-            return;
-        }
-        if (@atomicRmw(ResetEvent, re, .Xchg, .is_set, .release) == .waiting) {
-            Futex.wake(@ptrCast(re), std.math.maxInt(u32));
-        }
-    }
-
-    /// Unmarks the ResetEvent as if `set` was never called.
-    ///
-    /// Assumes no threads are blocked in `wait` or `timedWait`. Concurrent
-    /// calls to `set`, `isSet` and `reset` are allowed.
-    pub fn reset(re: *ResetEvent) void {
-        if (builtin.single_threaded) {
-            re.* = .unset;
-            return;
-        }
-        @atomicStore(ResetEvent, re, .unset, .monotonic);
-    }
-};
-
-const Thread = @This();
 const Impl = if (native_os == .windows)
     WindowsThreadImpl
 else if (use_pthreads)
@@ -191,11 +63,8 @@ pub fn setName(self: Thread, io: Io, name: []const u8) SetNameError!void {
         .linux => if (use_pthreads) {
             if (self.getHandle() == std.c.pthread_self()) {
                 // Set the name of the calling thread (no thread id required).
-                const err = try posix.prctl(.SET_NAME, .{@intFromPtr(name_with_terminator.ptr)});
-                switch (@as(posix.E, @enumFromInt(err))) {
-                    .SUCCESS => return,
-                    else => |e| return posix.unexpectedErrno(e),
-                }
+                assert(try posix.prctl(.SET_NAME, .{@intFromPtr(name_with_terminator.ptr)}) == 0);
+                return;
             } else {
                 const err = std.c.pthread_setname_np(self.getHandle(), name_with_terminator.ptr);
                 switch (@as(posix.E, @enumFromInt(err))) {
@@ -216,20 +85,10 @@ pub fn setName(self: Thread, io: Io, name: []const u8) SetNameError!void {
         },
         .windows => {
             var buf: [max_name_len]u16 = undefined;
-            const len = try std.unicode.wtf8ToWtf16Le(&buf, name);
-            const byte_len = math.cast(c_ushort, len * 2) orelse return error.NameTooLong;
-
-            // Note: NT allocates its own copy, no use-after-free here.
-            const unicode_string = windows.UNICODE_STRING{
-                .Length = byte_len,
-                .MaximumLength = byte_len,
-                .Buffer = &buf,
-            };
-
             switch (windows.ntdll.NtSetInformationThread(
                 self.getHandle(),
                 .NameInformation,
-                &unicode_string,
+                &windows.UNICODE_STRING.init(buf[0..try std.unicode.wtf8ToWtf16Le(&buf, name)]),
                 @sizeOf(windows.UNICODE_STRING),
             )) {
                 .SUCCESS => return,
@@ -305,11 +164,8 @@ pub fn getName(self: Thread, buffer_ptr: *[max_name_len:0]u8) GetNameError!?[]co
         .linux => if (use_pthreads) {
             if (self.getHandle() == std.c.pthread_self()) {
                 // Get the name of the calling thread (no thread id required).
-                const err = try posix.prctl(.GET_NAME, .{@intFromPtr(buffer.ptr)});
-                switch (@as(posix.E, @enumFromInt(err))) {
-                    .SUCCESS => return std.mem.sliceTo(buffer, 0),
-                    else => |e| return posix.unexpectedErrno(e),
-                }
+                assert(try posix.prctl(.GET_NAME, .{@intFromPtr(buffer.ptr)}) == 0);
+                return std.mem.sliceTo(buffer, 0);
             } else {
                 const err = std.c.pthread_getname_np(self.getHandle(), buffer.ptr, max_name_len + 1);
                 switch (@as(posix.E, @enumFromInt(err))) {
@@ -345,8 +201,8 @@ pub fn getName(self: Thread, buffer_ptr: *[max_name_len:0]u8) GetNameError!?[]co
                 null,
             )) {
                 .SUCCESS => {
-                    const string = @as(*const windows.UNICODE_STRING, @ptrCast(&buf));
-                    const len = std.unicode.wtf16LeToWtf8(buffer, string.Buffer.?[0 .. string.Length / 2]);
+                    const string: *const windows.UNICODE_STRING = @ptrCast(&buf);
+                    const len = std.unicode.wtf16LeToWtf8(buffer, string.slice());
                     return if (len > 0) buffer[0..len] else null;
                 },
                 .NOT_IMPLEMENTED => return error.Unsupported,
@@ -543,14 +399,19 @@ const Completion = std.atomic.Value(enum(if (builtin.zig_backend == .stage2_risc
 /// Performs implementation-agnostic thread setup (`maybeAttachSignalStack`), then calls the given
 /// thread entry point `f` with `args` and handles the result.
 fn callFn(comptime f: anytype, args: anytype) switch (Impl) {
-    WindowsThreadImpl => windows.DWORD,
+    WindowsThreadImpl => windows.NTSTATUS,
     LinuxThreadImpl => u8,
     PosixThreadImpl => ?*anyopaque,
     else => unreachable,
 } {
     maybeAttachSignalStack();
 
-    const default_value = if (Impl == PosixThreadImpl) null else 0;
+    const default_value = switch (Impl) {
+        WindowsThreadImpl => .SUCCESS,
+        LinuxThreadImpl => 0,
+        PosixThreadImpl => null,
+        else => unreachable,
+    };
     const bad_fn_ret = "expected return type of startFn to be 'u8', 'noreturn', '!noreturn', 'void', or '!void'";
 
     switch (@typeInfo(@typeInfo(@TypeOf(f)).@"fn".return_type.?)) {
@@ -567,12 +428,13 @@ fn callFn(comptime f: anytype, args: anytype) switch (Impl) {
             }
 
             const status = @call(.auto, f, args);
-            if (Impl != PosixThreadImpl) {
-                return status;
+            switch (Impl) {
+                WindowsThreadImpl => return @enumFromInt(status),
+                LinuxThreadImpl => return status,
+                // pthreads don't support exit status, ignore value
+                PosixThreadImpl => return default_value,
+                else => unreachable,
             }
-
-            // pthreads don't support exit status, ignore value
-            return default_value;
         },
         .error_union => |info| {
             switch (info.payload) {
@@ -580,7 +442,7 @@ fn callFn(comptime f: anytype, args: anytype) switch (Impl) {
                     @call(.auto, f, args) catch |err| {
                         std.debug.print("error: {s}\n", .{@errorName(err)});
                         if (@errorReturnTrace()) |trace| {
-                            std.debug.dumpStackTrace(trace);
+                            std.debug.dumpErrorReturnTrace(trace);
                         }
                     };
 
@@ -664,7 +526,7 @@ const WindowsThreadImpl = struct {
             fn_args: Args,
             thread: ThreadCompletion,
 
-            fn entryFn(raw_ptr: windows.PVOID) callconv(.winapi) windows.DWORD {
+            fn entryFn(raw_ptr: windows.PVOID) callconv(.winapi) windows.NTSTATUS {
                 const self: *@This() = @ptrCast(@alignCast(raw_ptr));
                 defer switch (self.thread.completion.swap(.completed, .seq_cst)) {
                     .running => {},
@@ -692,21 +554,72 @@ const WindowsThreadImpl = struct {
             },
         };
 
-        // Windows appears to only support SYSTEM_INFO.dwAllocationGranularity minimum stack size.
-        // Going lower makes it default to that specified in the executable (~1mb).
-        // Its also fine if the limit here is incorrect as stack size is only a hint.
+        // Windows appears to only support SYSTEM.BASIC_INFORMATION.AllocationGranularity
+        // minimum stack size. Going lower makes it default to that specified in the executable
+        // (~1mb). Its also fine if the limit here is incorrect as stack size is only a hint.
         const stack_size = @max(64 * 1024, std.math.lossyCast(u32, config.stack_size));
 
-        instance.thread.thread_handle = windows.kernel32.CreateThread(
-            null,
-            stack_size,
-            Instance.entryFn,
-            instance,
-            0,
-            null,
-        ) orelse {
-            const errno = windows.GetLastError();
-            return windows.unexpectedError(errno);
+        // Intended to be equivalent to a kernel32.CreateThread call with no flags set.
+        // However, CreateThread is just a wrapper around CreateRemoteThreadEx,
+        // so that's the more relevant function in this context.
+        //
+        // https://github.com/wine-mirror/wine/blob/3d128be6400b3869119d293d0c8fa9e7702978f8/dlls/kernelbase/thread.c#L85
+        instance.thread.thread_handle = blk: {
+            var active_ctx: ?windows.HANDLE = undefined;
+            // Note: Can return null on SUCCESS
+            switch (windows.ntdll.RtlGetActiveActivationContext(&active_ctx)) {
+                .SUCCESS => {},
+                else => |status| return windows.unexpectedStatus(status),
+            }
+            defer if (active_ctx) |ctx| windows.ntdll.RtlReleaseActivationContext(ctx);
+
+            var teb: *windows.TEB = undefined;
+            var attr_list = windows.PS.ATTRIBUTE.LIST{
+                .TotalLength = @sizeOf(windows.PS.ATTRIBUTE.LIST),
+                .Attributes = .{
+                    .{
+                        .Attribute = .TEB_ADDRESS,
+                        .Size = @sizeOf(*windows.TEB),
+                        .u = .{
+                            .ValuePtr = @ptrCast(&teb),
+                        },
+                        .ReturnLength = null,
+                    },
+                },
+            };
+
+            var thread_handle: windows.HANDLE = undefined;
+            switch (windows.ntdll.NtCreateThreadEx(
+                &thread_handle,
+                .{ .MAXIMUM_ALLOWED = true },
+                &.{},
+                windows.GetCurrentProcess(),
+                Instance.entryFn,
+                instance,
+                .{ .CREATE_SUSPENDED = true },
+                0,
+                @enumFromInt(stack_size),
+                .default,
+                &attr_list,
+            )) {
+                .SUCCESS => {},
+                else => |status| return windows.unexpectedStatus(status),
+            }
+
+            if (active_ctx) |ctx| {
+                var cookie: windows.ULONG = 0;
+                switch (windows.ntdll.RtlActivateActivationContextEx(0, teb, ctx, &cookie)) {
+                    .SUCCESS => {},
+                    else => |status| return windows.unexpectedStatus(status),
+                }
+            }
+
+            switch (windows.ntdll.NtResumeThread(thread_handle, null)) {
+                .SUCCESS => {},
+                else => |status| return windows.unexpectedStatus(status),
+            }
+
+            break :blk thread_handle;
         };
 
         return Impl{ .thread = &instance.thread };
@@ -726,7 +639,11 @@ const WindowsThreadImpl = struct {
     }
 
     fn join(self: Impl) void {
-        windows.WaitForSingleObjectEx(self.thread.thread_handle, windows.INFINITE, false) catch unreachable;
+        const infinite_timeout: windows.LARGE_INTEGER = std.math.minInt(windows.LARGE_INTEGER);
+        switch (windows.ntdll.NtWaitForSingleObject(self.thread.thread_handle, .FALSE, &infinite_timeout)) {
+            windows.NTSTATUS.WAIT_0 => {},
+            else => |status| windows.unexpectedStatus(status) catch unreachable,
+        }
         windows.CloseHandle(self.thread.thread_handle);
         assert(self.thread.completion.load(.seq_cst) == .completed);
         self.thread.free();
@@ -809,12 +726,15 @@ const PosixThreadImpl = struct {
             else => {
                 var count: c_int = undefined;
                 var count_len: usize = @sizeOf(c_int);
-                const name = if (comptime target.os.tag.isDarwin()) "hw.logicalcpu" else "hw.ncpu";
-                posix.sysctlbynameZ(name, &count, &count_len, null, 0) catch |err| switch (err) {
-                    error.UnknownName => unreachable,
-                    else => |e| return e,
-                };
-                return @as(usize, @intCast(count));
+                const name = comptime if (target.os.tag.isDarwin()) "hw.logicalcpu" else "hw.ncpu";
+                switch (posix.errno(posix.system.sysctlbyname(name, &count, &count_len, null, 0))) {
+                    .SUCCESS => return @intCast(count),
+                    .FAULT => unreachable,
+                    .PERM => return error.PermissionDenied,
+                    .NOMEM => return error.SystemResources,
+                    .NOENT => unreachable,
+                    else => |err| return posix.unexpectedErrno(err),
+                }
             },
         }
     }
@@ -1012,7 +932,7 @@ const WasiThreadImpl = struct {
                         @call(.auto, f, w.args) catch |err| {
                             std.debug.print("error: {s}\n", .{@errorName(err)});
                             if (@errorReturnTrace()) |trace| {
-                                std.debug.dumpStackTrace(trace);
+                                std.debug.dumpErrorReturnTrace(trace);
                             }
                         };
                     },
@@ -1227,6 +1147,11 @@ const LinuxThreadImpl = struct {
         /// Ported over from musl libc's pthread detached implementation:
         /// https://github.com/ifduyue/musl/search?q=__unmapself
         fn freeAndExit(self: *ThreadCompletion) noreturn {
+            // If we do not reset the child_tidptr to null here, the kernel would later write the
+            // value zero to that address, which is inside the block we're unmapping below, after
+            // our thread exits.  This can sometimes corrupt memory in other mmap blocks from
+            // unrelated concurrent threads.
+            _ = linux.set_tid_address(null);
             // If a signal were delivered between SYS_munmap and SYS_exit, any installed signal
             // handler would immediately segfault due to the stack being unmapped. To avoid this,
             // we need to mask all signals before entering the inline asm.
@@ -1564,7 +1489,7 @@ const LinuxThreadImpl = struct {
         }
 
         // Prepare the TLS segment and prepare a user_desc struct when needed on x86
-        var tls_ptr = linux.tls.prepareArea(mapped[tls_offset..]);
+        var tls_ptr = linux.tls.prepareArea(mapped[tls_offset..][0..linux.tls.area_desc.size]);
         var user_desc: if (target.cpu.arch == .x86) linux.user_desc else void = undefined;
         if (target.cpu.arch == .x86) {
             defer tls_ptr = @intFromPtr(&user_desc);
@@ -1673,16 +1598,16 @@ test "setName, getName" {
     const io = testing.io;
 
     const Context = struct {
-        start_wait_event: ResetEvent = .unset,
-        test_done_event: ResetEvent = .unset,
-        thread_done_event: ResetEvent = .unset,
+        start_wait_event: Io.Event = .unset,
+        test_done_event: Io.Event = .unset,
+        thread_done_event: Io.Event = .unset,
 
         done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
         thread: Thread = undefined,
 
         pub fn run(ctx: *@This()) !void {
             // Wait for the main thread to have set the thread field in the context.
-            ctx.start_wait_event.wait();
+            try ctx.start_wait_event.wait(io);
 
             switch (native_os) {
                 .windows => testThreadName(io, &ctx.thread) catch |err| switch (err) {
@@ -1693,10 +1618,10 @@ test "setName, getName" {
             }
 
             // Signal our test is done
-            ctx.test_done_event.set();
+            ctx.test_done_event.set(io);
 
             // wait for the thread to property exit
-            ctx.thread_done_event.wait();
+            try ctx.thread_done_event.wait(io);
         }
     };
 
@@ -1704,8 +1629,8 @@ test "setName, getName" {
     var thread = try spawn(.{}, Context.run, .{&context});
 
     context.thread = thread;
-    context.start_wait_event.set();
-    context.test_done_event.wait();
+    context.start_wait_event.set(io);
+    try context.test_done_event.wait(io);
 
     switch (native_os) {
         .driverkit, .ios, .maccatalyst, .macos, .tvos, .visionos, .watchos => {
@@ -1719,31 +1644,24 @@ test "setName, getName" {
         else => try testThreadName(io, &thread),
     }
 
-    context.thread_done_event.set();
+    context.thread_done_event.set(io);
     thread.join();
 }
 
-test {
-    _ = Futex;
-    _ = ResetEvent;
-    _ = Mutex;
-    _ = Semaphore;
-    _ = Condition;
-    _ = RwLock;
-}
-
-fn testIncrementNotify(value: *usize, event: *ResetEvent) void {
+fn testIncrementNotify(io: Io, value: *usize, event: *Io.Event) void {
     value.* += 1;
-    event.set();
+    event.set(io);
 }
 
 test join {
     if (builtin.single_threaded) return error.SkipZigTest;
 
-    var value: usize = 0;
-    var event: ResetEvent = .unset;
+    const io = testing.io;
 
-    const thread = try Thread.spawn(.{}, testIncrementNotify, .{ &value, &event });
+    var value: usize = 0;
+    var event: Io.Event = .unset;
+
+    const thread = try Thread.spawn(.{}, testIncrementNotify, .{ io, &value, &event });
     thread.join();
 
     try std.testing.expectEqual(value, 1);
@@ -1752,13 +1670,15 @@ test join {
 test detach {
     if (builtin.single_threaded) return error.SkipZigTest;
 
-    var value: usize = 0;
-    var event: ResetEvent = .unset;
+    const io = testing.io;
 
-    const thread = try Thread.spawn(.{}, testIncrementNotify, .{ &value, &event });
+    var value: usize = 0;
+    var event: Io.Event = .unset;
+
+    const thread = try Thread.spawn(.{}, testIncrementNotify, .{ io, &value, &event });
     thread.detach();
 
-    event.wait();
+    try event.wait(io);
     try std.testing.expectEqual(value, 1);
 }
 
@@ -1800,127 +1720,6 @@ fn testTls() !void {
     if (x != 1235) return error.TlsBadEndValue;
 }
 
-test "ResetEvent smoke test" {
-    var event: ResetEvent = .unset;
-    try testing.expectEqual(false, event.isSet());
-
-    // make sure the event gets set
-    event.set();
-    try testing.expectEqual(true, event.isSet());
-
-    // make sure the event gets unset again
-    event.reset();
-    try testing.expectEqual(false, event.isSet());
-
-    // waits should timeout as there's no other thread to set the event
-    try testing.expectError(error.Timeout, event.timedWait(0));
-    try testing.expectError(error.Timeout, event.timedWait(std.time.ns_per_ms));
-
-    // set the event again and make sure waits complete
-    event.set();
-    event.wait();
-    try event.timedWait(std.time.ns_per_ms);
-    try testing.expectEqual(true, event.isSet());
-}
-
-test "ResetEvent signaling" {
-    // This test requires spawning threads
-    if (builtin.single_threaded) {
-        return error.SkipZigTest;
-    }
-
-    const Context = struct {
-        in: ResetEvent = .unset,
-        out: ResetEvent = .unset,
-        value: usize = 0,
-
-        fn input(self: *@This()) !void {
-            // wait for the value to become 1
-            self.in.wait();
-            self.in.reset();
-            try testing.expectEqual(self.value, 1);
-
-            // bump the value and wake up output()
-            self.value = 2;
-            self.out.set();
-
-            // wait for output to receive 2, bump the value and wake us up with 3
-            self.in.wait();
-            self.in.reset();
-            try testing.expectEqual(self.value, 3);
-
-            // bump the value and wake up output() for it to see 4
-            self.value = 4;
-            self.out.set();
-        }
-
-        fn output(self: *@This()) !void {
-            // start with 0 and bump the value for input to see 1
-            try testing.expectEqual(self.value, 0);
-            self.value = 1;
-            self.in.set();
-
-            // wait for input to receive 1, bump the value to 2 and wake us up
-            self.out.wait();
-            self.out.reset();
-            try testing.expectEqual(self.value, 2);
-
-            // bump the value to 3 for input to see (rhymes)
-            self.value = 3;
-            self.in.set();
-
-            // wait for input to bump the value to 4 and receive no more (rhymes)
-            self.out.wait();
-            self.out.reset();
-            try testing.expectEqual(self.value, 4);
-        }
-    };
-
-    var ctx = Context{};
-
-    const thread = try std.Thread.spawn(.{}, Context.output, .{&ctx});
-    defer thread.join();
-
-    try ctx.input();
-}
-
-test "ResetEvent broadcast" {
-    // This test requires spawning threads
-    if (builtin.single_threaded) {
-        return error.SkipZigTest;
-    }
-
-    const num_threads = 10;
-    const Barrier = struct {
-        event: ResetEvent = .unset,
-        counter: std.atomic.Value(usize) = std.atomic.Value(usize).init(num_threads),
-
-        fn wait(self: *@This()) void {
-            if (self.counter.fetchSub(1, .acq_rel) == 1) {
-                self.event.set();
-            }
-        }
-    };
-
-    const Context = struct {
-        start_barrier: Barrier = .{},
-        finish_barrier: Barrier = .{},
-
-        fn run(self: *@This()) void {
-            self.start_barrier.wait();
-            self.finish_barrier.wait();
-        }
-    };
-
-    var ctx = Context{};
-    var threads: [num_threads - 1]std.Thread = undefined;
-
-    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Context.run, .{&ctx});
-    defer for (threads) |t| t.join();
-
-    ctx.run();
-}
-
 /// Configures the per-thread alternative signal stack requested by `std.options.signal_stack_size`.
 pub fn maybeAttachSignalStack() void {
     const size = std.options.signal_stack_size orelse return;
@@ -1941,6 +1740,6 @@ pub fn maybeAttachSignalStack() void {
     }, null) catch |err| switch (err) {
         error.SizeTooSmall => unreachable, // `std.options.signal_stack_size` must be sufficient for the target
         error.PermissionDenied => unreachable, // called `maybeAttachSignalStack` from a signal handler
-        error.Unexpected => @panic("unexpected error attaching signal stack"),
+        error.Unexpected => unreachable,
     };
 }

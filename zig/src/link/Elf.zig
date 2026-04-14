@@ -881,10 +881,10 @@ fn flushInner(self: *Elf, arena: Allocator, tid: Zcu.PerThread.Id) !void {
     self.rela_plt.clearRetainingCapacity();
 
     if (self.zigObjectPtr()) |zo| {
-        var undefs: std.AutoArrayHashMap(SymbolResolver.Index, std.array_list.Managed(Ref)) = .init(gpa);
+        var undefs: std.array_hash_map.Auto(SymbolResolver.Index, std.array_list.Managed(Ref)) = .empty;
         defer {
             for (undefs.values()) |*refs| refs.deinit();
-            undefs.deinit();
+            undefs.deinit(gpa);
         }
 
         var has_reloc_errors = false;
@@ -1332,10 +1332,10 @@ fn scanRelocs(self: *Elf) !void {
     const gpa = self.base.comp.gpa;
     const shared_objects = self.shared_objects.values();
 
-    var undefs: std.AutoArrayHashMap(SymbolResolver.Index, std.array_list.Managed(Ref)) = .init(gpa);
+    var undefs: std.array_hash_map.Auto(SymbolResolver.Index, std.array_list.Managed(Ref)) = .empty;
     defer {
         for (undefs.values()) |*refs| refs.deinit();
-        undefs.deinit();
+        undefs.deinit(gpa);
     }
 
     var has_reloc_errors = false;
@@ -1711,23 +1711,13 @@ pub fn updateContainerType(
     self: *Elf,
     pt: Zcu.PerThread,
     ty: InternPool.Index,
+    success: bool,
 ) link.File.UpdateContainerTypeError!void {
     if (build_options.skip_non_native and builtin.object_format != .elf) {
         @panic("Attempted to compile for object format that was disabled by build configuration");
     }
-    const zcu = pt.zcu;
-    const gpa = zcu.gpa;
-    return self.zigObjectPtr().?.updateContainerType(pt, ty) catch |err| switch (err) {
+    return self.zigObjectPtr().?.updateContainerType(pt, ty, success) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
-        else => |e| {
-            try zcu.failed_types.putNoClobber(gpa, ty, try Zcu.ErrorMsg.create(
-                gpa,
-                zcu.typeSrcLoc(ty),
-                "failed to update container type: {s}",
-                .{@errorName(e)},
-            ));
-            return error.TypeFailureReported;
-        },
     };
 }
 
@@ -1758,12 +1748,12 @@ pub fn deleteExport(
 fn checkDuplicates(self: *Elf) !void {
     const gpa = self.base.comp.gpa;
 
-    var dupes = std.AutoArrayHashMap(SymbolResolver.Index, std.ArrayList(File.Index)).init(gpa);
+    var dupes: std.array_hash_map.Auto(SymbolResolver.Index, std.ArrayList(File.Index)) = .empty;
     defer {
         for (dupes.values()) |*list| {
             list.deinit(gpa);
         }
-        dupes.deinit();
+        dupes.deinit(gpa);
     }
 
     if (self.zigObjectPtr()) |zig_object| {
@@ -3002,10 +2992,10 @@ fn allocateSpecialPhdrs(self: *Elf) void {
 fn writeAtoms(self: *Elf) !void {
     const gpa = self.base.comp.gpa;
 
-    var undefs: std.AutoArrayHashMap(SymbolResolver.Index, std.array_list.Managed(Ref)) = .init(gpa);
+    var undefs: std.array_hash_map.Auto(SymbolResolver.Index, std.array_list.Managed(Ref)) = .empty;
     defer {
         for (undefs.values()) |*refs| refs.deinit();
-        undefs.deinit();
+        undefs.deinit(gpa);
     }
 
     var buffer: std.Io.Writer.Allocating = .init(gpa);

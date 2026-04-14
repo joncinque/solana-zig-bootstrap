@@ -2,7 +2,8 @@
 //!
 //! The source of an `error.WriteFailed` is always the backing writer. After an
 //! `error.WriteFailed`, the `.writer` becomes `.failing` and is unrecoverable.
-//! After a `flush`, the writer also becomes `.failing` since the stream has
+//!
+//! After `finish`, the writer also becomes `.failing` since the stream has
 //! been finished. This behavior also applies to `Raw` and `Huffman`.
 
 // Implementation details:
@@ -43,9 +44,10 @@ const PackedOptionalU15 = packed struct(u16) {
     pub const null_bit: PackedOptionalU15 = .{ .value = 0, .is_null = true };
 };
 
-/// After `flush` is called, all vtable calls with result in `error.WriteFailed.`
+/// After `finish` is called, all vtable calls with result in `error.WriteFailed`.
 writer: Writer,
-has_history: bool,
+history_len: u16,
+history_end_unhashed: bool,
 bit_writer: BitWriter,
 buffered_tokens: struct {
     /// List of `TokenBufferEntryHeader`s and their trailing data.
@@ -108,12 +110,41 @@ const BitWriter = struct {
         b.buffered = @intCast(combined >> (combined_bits - b.buffered_n));
     }
 
-    /// Assserts one byte can be written to `b.otuput` without rebasing.
+    /// Asserts one byte can be written to `b.output` without rebasing.
     pub fn byteAlign(b: *BitWriter) void {
         b.output.unusedCapacitySlice()[0] = b.buffered;
         b.output.advance(@intFromBool(b.buffered_n != 0));
         b.buffered = 0;
         b.buffered_n = 0;
+    }
+
+    /// Byte align using only empty flate blocks
+    pub fn byteAlignBlocks(b: *BitWriter) Writer.Error!void {
+        if (b.buffered_n == 0) return;
+
+        // There are two methods to do this:
+        // 1. A store block (5 or 6 bytes)
+        // 2. Outputting empty 10-bit fixed blocks until aligned
+        //
+        // Fixed blocks advance the bit alignment by two, and so can only used for even numbers
+        // requiring a maximum of four bytes (three blocks = 30 bits) to which is always more
+        // efficient than store blocks.
+        if (b.buffered_n & 1 == 0) {
+            const splat = (8 - @as(u5, b.buffered_n)) >> 1;
+            const bits = splat * 10;
+            // fixed eos code is 0, so the only bits are for the block header
+            const pattern: u32 = BlockHeader.int(.{ .kind = .fixed, .final = false });
+            const splatted = ((pattern << 20) | (pattern << 10) | pattern) >> (30 - bits);
+            try b.write(splatted, bits);
+        } else {
+            try b.write(BlockHeader.int(.{ .kind = .stored, .final = false }), 3);
+            try b.output.rebase(0, 5);
+            b.byteAlign();
+            b.output.writeInt(u16, 0x0000, .little) catch unreachable;
+            b.output.writeInt(u16, 0xffff, .little) catch unreachable;
+        }
+
+        assert(b.buffered_n == 0);
     }
 
     pub fn writeClen(
@@ -159,9 +190,9 @@ const BitWriter = struct {
 /// The maximum value is `math.maxInt(u16) - 1` since one token is reserved for end-of-block.
 const block_tokens: u16 = 1 << 15;
 const lookup_hash_bits = 15;
-const Hash = u16; // `u[lookup_hash_bits]` is not used due to worse optimization (with LLVM 21)
+const Hash = u16; // `@Int(.unsigned, lookup_hash_bits)` is not used due to worse optimization (with LLVM 21)
 const seq_bytes = 3; // not intended to be changed
-const Seq = std.meta.Int(.unsigned, seq_bytes * 8);
+const Seq = @Int(.unsigned, seq_bytes * 8);
 
 const TokenBufferEntryHeader = packed struct(u16) {
     kind: enum(u1) {
@@ -267,7 +298,7 @@ pub const Options = struct {
     pub const best = level_9;
 };
 
-/// It is asserted `buffer` is least `flate.max_history_len` bytes.
+/// It is asserted `buffer` is least `flate.max_window_len` bytes.
 /// It is asserted `output` has a capacity of at least 8 bytes.
 pub fn init(
     output: *Writer,
@@ -279,7 +310,7 @@ pub fn init(
     assert(buffer.len >= flate.max_window_len);
 
     // note that disallowing some of these simplifies matching logic
-    assert(opts.chain != 0); // use `Huffman`, disallowing this simplies matching
+    assert(opts.chain != 0); // use `Huffman`; disallowing this simplies matching
     assert(opts.good >= 3 and opts.nice >= 3); // a match will (usually) not be found
     assert(opts.good <= 258 and opts.nice <= 258); // a longer match will not be found
     assert(opts.lazy <= opts.nice); // a longer match will (usually) not be found
@@ -295,7 +326,8 @@ pub fn init(
                 .rebase = rebase,
             },
         },
-        .has_history = false,
+        .history_len = 0,
+        .history_end_unhashed = false,
         .bit_writer = .init(output),
         .buffered_tokens = .empty,
         .lookup = .{
@@ -314,68 +346,110 @@ fn drain(w: *Writer, data: []const []const u8, splat: usize) Writer.Error!usize 
     errdefer w.* = .failing;
     // There may have not been enough space in the buffer and the write was sent directly here.
     // However, it is required that all data goes through the buffer to keep a history.
-    //
-    // Additionally, ensuring the buffer is always full ensures there is always a full history
-    // after.
     const data_n = w.buffer.len - w.end;
     _ = w.fixedDrain(data, splat) catch {};
     assert(w.end == w.buffer.len);
-    try rebaseInner(w, 0, 1, false);
+    try rebaseInner(w, 0, 1, false, false);
     return data_n;
 }
 
 fn flush(w: *Writer) Writer.Error!void {
-    defer w.* = .failing;
+    errdefer w.* = .failing;
+    try rebaseInner(w, 0, w.buffer.len - flate.history_len, true, false);
     const c: *Compress = @fieldParentPtr("writer", w);
-    try rebaseInner(w, 0, w.buffer.len - flate.history_len, true);
+    try c.bit_writer.byteAlignBlocks();
+}
+
+pub fn finish(c: *Compress) Writer.Error!void {
+    defer c.writer = .failing;
+    try rebaseInner(&c.writer, 0, c.writer.buffer.len - flate.history_len, true, true);
     try c.bit_writer.output.rebase(0, 1);
     c.bit_writer.byteAlign();
     try c.hasher.writeFooter(c.bit_writer.output);
 }
 
 fn rebase(w: *Writer, preserve: usize, capacity: usize) Writer.Error!void {
-    return rebaseInner(w, preserve, capacity, false);
+    errdefer w.* = .failing;
+    return rebaseInner(w, preserve, capacity, false, false);
 }
 
 pub const rebase_min_preserve = flate.history_len;
 pub const rebase_reserved_capacity = (token.max_length + 1) + seq_bytes;
 
-fn rebaseInner(w: *Writer, preserve: usize, capacity: usize, eos: bool) Writer.Error!void {
-    if (!eos) {
+fn rebaseInner(
+    w: *Writer,
+    preserve: usize,
+    capacity: usize,
+    is_flush: bool,
+    is_finish: bool,
+) Writer.Error!void {
+    if (!is_flush) {
         assert(@max(preserve, rebase_min_preserve) + (capacity + rebase_reserved_capacity) <= w.buffer.len);
-        assert(w.end >= flate.history_len + rebase_reserved_capacity); // Above assert should
-        // fail since rebase is only called when `capacity` is not present. This assertion is
-        // important because a full history is required at the end.
     } else {
+        // Preverse is not considered for `matching_end`
         assert(preserve == 0 and capacity == w.buffer.len - flate.history_len);
     }
+    if (is_finish) assert(is_flush);
 
     const c: *Compress = @fieldParentPtr("writer", w);
     const buffered = w.buffered();
 
-    const start = @as(usize, flate.history_len) * @intFromBool(c.has_history);
-    const lit_end: usize = if (!eos)
+    const start: usize = c.history_len;
+    const hashable_len = buffered.len -| (seq_bytes - 1);
+    const matching_end: usize = if (!is_flush)
         buffered.len - rebase_reserved_capacity - (preserve -| flate.history_len)
     else
-        buffered.len -| (seq_bytes - 1);
+        hashable_len;
 
     var i = start;
     var last_unmatched = i;
-    // Read from `w.buffer` instead of `buffered` since the latter may not
-    // have enough bytes. If this is the case, this variable is not used.
-    var seq: Seq = mem.readInt(
-        std.meta.Int(.unsigned, (seq_bytes - 1) * 8),
-        w.buffer[i..][0 .. seq_bytes - 1],
-        .big,
-    );
-    if (buffered[i..].len < seq_bytes - 1) {
-        @branchHint(.unlikely);
-        assert(eos);
-        seq = undefined;
-        assert(i >= lit_end);
-    }
+    var seq: Seq = start_seq: {
+        if (c.history_end_unhashed) {
+            @branchHint(.unlikely);
 
-    while (i < lit_end) {
+            assert(i != 0);
+            i -|= seq_bytes - 1;
+            var seq: Seq = mem.readInt(
+                @Int(.unsigned, (seq_bytes - 1) * 8),
+                w.buffer[i..][0 .. seq_bytes - 1],
+                .big,
+            );
+
+            while (i < @min(start, hashable_len)) {
+                seq <<= 8;
+                seq |= buffered[i + (seq_bytes - 1)];
+                c.addHash(i, hash(seq));
+                i += 1;
+            }
+
+            if (i < start) {
+                @branchHint(.unlikely);
+                i = start;
+                assert(i >= hashable_len);
+                assert(i >= matching_end);
+                assert(is_flush);
+                break :start_seq undefined; // Unused
+            }
+
+            c.history_end_unhashed = false;
+            break :start_seq seq;
+        }
+
+        if (i >= hashable_len) {
+            @branchHint(.unlikely);
+            assert(i >= matching_end);
+            assert(is_flush);
+            break :start_seq undefined; // Unused
+        }
+
+        break :start_seq mem.readInt(
+            @Int(.unsigned, (seq_bytes - 1) * 8),
+            buffered[i..][0 .. seq_bytes - 1],
+            .big,
+        );
+    };
+
+    while (i < matching_end) {
         var match_start = i;
         seq <<= 8;
         seq |= buffered[i + (seq_bytes - 1)];
@@ -420,43 +494,50 @@ fn rebaseInner(w: *Writer, preserve: usize, capacity: usize, eos: bool) Writer.E
 
         try c.outputBytes(buffered[last_unmatched..match_start]);
         try c.outputMatch(@intCast(match.dist), @intCast(match.len - 3));
-
         last_unmatched = match_start + match.len;
-        if (last_unmatched + seq_bytes >= w.end) {
-            @branchHint(.unlikely);
-            assert(eos);
-            i = undefined;
-            break;
-        }
 
-        while (true) {
+        while (i < hashable_len) {
             seq <<= 8;
             seq |= buffered[i + (seq_bytes - 1)];
-            _ = c.addHash(i, hash(seq));
+            c.addHash(i, hash(seq));
             i += 1;
 
             match_unadded -= 1;
             if (match_unadded == 0) break;
+        } else {
+            @branchHint(.unlikely);
+            assert(is_flush);
+            // `c.history_end_unhashed` is set down below
+            break;
         }
         assert(i == match_start + match.len);
     }
 
-    if (eos) {
-        i = undefined; // (from match hashing logic)
+    if (is_flush) {
         try c.outputBytes(buffered[last_unmatched..]);
         c.hasher.update(buffered[start..]);
-        try c.writeBlock(true);
-        return;
+
+        if (is_finish) {
+            try c.writeBlock(true);
+            return; // Other state does not need updated since the writer transitions to `.failing`
+        }
+
+        i = buffered.len;
+        c.history_end_unhashed = i != 0;
+
+        if (c.buffered_tokens.n != 0) {
+            try c.writeBlock(false);
+        }
+    } else {
+        try c.outputBytes(buffered[last_unmatched..i]);
+        c.hasher.update(buffered[start..i]);
     }
 
-    try c.outputBytes(buffered[last_unmatched..i]);
-    c.hasher.update(buffered[start..i]);
-
-    const preserved = buffered[i - flate.history_len ..];
-    assert(preserved.len > @max(rebase_min_preserve, preserve));
+    c.history_len = @min(i, flate.history_len);
+    const preserved = buffered[i - c.history_len ..];
+    if (!is_flush) assert(preserved.len >= @max(rebase_min_preserve, preserve));
     @memmove(w.buffer[0..preserved.len], preserved);
     w.end = preserved.len;
-    c.has_history = true;
 }
 
 fn addHash(c: *Compress, i: usize, h: Hash) void {
@@ -499,7 +580,7 @@ fn betterMatchLen(old: u16, prev: []const u8, bytes: []const u8) u16 {
     assert(bytes.len >= token.min_length);
 
     var i: u16 = 0;
-    const Block = std.meta.Int(.unsigned, @min(math.divCeil(
+    const Block = @Int(.unsigned, @min(math.divCeil(
         comptime_int,
         math.ceilPowerOfTwoAssert(usize, @bitSizeOf(usize)),
         8,
@@ -558,45 +639,35 @@ test betterMatchLen {
     try std.testing.fuzz({}, testFuzzedMatchLen, .{});
 }
 
-fn testFuzzedMatchLen(_: void, input: []const u8) !void {
+fn testFuzzedMatchLen(_: void, smith: *std.testing.Smith) !void {
     @disableInstrumentation();
-    var r: Io.Reader = .fixed(input);
     var buf: [1024]u8 = undefined;
     var w: Writer = .fixed(&buf);
-    var old = r.takeLeb128(u9) catch 0;
-    var bytes_off = @max(1, r.takeLeb128(u10) catch 258);
-    const prev_back = @max(1, r.takeLeb128(u10) catch 258);
 
-    while (r.takeByte()) |byte| {
-        const op: packed struct(u8) {
-            kind: enum(u2) { splat, copy, insert_imm, insert },
-            imm: u6,
-
-            pub fn immOrByte(op_s: @This(), r_s: *Io.Reader) usize {
-                return if (op_s.imm == 0) op_s.imm else @as(usize, r_s.takeByte() catch 0) + 64;
-            }
-        } = @bitCast(byte);
-        (switch (op.kind) {
-            .splat => w.splatByteAll(r.takeByte() catch 0, op.immOrByte(&r)),
+    while (w.unusedCapacityLen() != 0 and !smith.eosWeightedSimple(7, 1)) {
+        switch (smith.value(enum(u2) { splat, copy, insert })) {
+            .splat => w.splatByteAll(
+                smith.value(u8),
+                smith.valueRangeAtMost(u9, 1, @min(511, w.unusedCapacityLen())),
+            ) catch unreachable,
             .copy => write: {
-                const start = w.buffered().len -| op.immOrByte(&r);
-                const len = @min(w.buffered().len - start, r.takeByte() catch 3);
-                break :write w.writeAll(w.buffered()[start..][0..len]);
+                if (w.buffered().len == 0) continue;
+                const start = smith.valueRangeAtMost(u10, 0, @intCast(w.buffered().len - 1));
+                const max_len = @min(w.unusedCapacityLen(), w.buffered().len - start);
+                const len = smith.valueRangeAtMost(u10, 1, @intCast(max_len));
+                break :write w.writeAll(w.buffered()[start..][0..len]) catch unreachable;
             },
-            .insert_imm => w.writeByte(op.imm),
-            .insert => w.writeAll(r.take(
-                @min(r.bufferedLen(), @as(usize, op.imm) + 1),
-            ) catch unreachable),
-        }) catch break;
-    } else |_| {}
+            .insert => w.advance(smith.slice(w.unusedCapacitySlice())),
+        }
+    }
+    w.splatByteAll(0, (1 + token.min_length) -| w.buffered().len) catch unreachable;
 
-    w.splatByteAll(0, (1 + 3) -| w.buffered().len) catch unreachable;
-    bytes_off = @min(bytes_off, @as(u10, @intCast(w.buffered().len - 3)));
-    const prev_off = bytes_off -| prev_back;
-    assert(prev_off < bytes_off);
+    const max_start = w.buffered().len - token.min_length;
+    const bytes_off = smith.valueRangeAtMost(u10, 1, @intCast(max_start));
+    const prev_off = smith.valueRangeAtMost(u10, 0, bytes_off - 1);
     const prev = w.buffered()[prev_off..];
     const bytes = w.buffered()[bytes_off..];
-    old = @min(old, bytes.len - 1, token.max_length - 1);
+    const old = smith.valueRangeLessThan(u10, 0, @min(bytes.len, token.max_length));
 
     const diff_index = mem.findDiff(u8, prev, bytes).?; // unwrap since lengths are not same
     const expected_len = @min(diff_index, 258);
@@ -808,7 +879,6 @@ test buildClen {
 
 fn writeBlock(c: *Compress, eos: bool) Writer.Error!void {
     const toks = &c.buffered_tokens;
-    if (!eos) assert(toks.n == block_tokens);
     assert(toks.lit_freqs[256] == 0);
     toks.lit_freqs[256] = 1;
 
@@ -1036,7 +1106,7 @@ const huffman = struct {
         max_bits: u4,
         incomplete_allowed: bool,
     ) struct { u32, u16 } {
-        assert(out_codes.len - 1 >= @intFromBool(incomplete_allowed));
+        assert(out_codes.len - 1 >= @intFromBool(!incomplete_allowed));
         // freqs and out_codes are in the loop to assert they are all the same length
         for (freqs, out_codes, out_bits) |_, _, n| assert(n == 0);
         assert(out_codes.len <= @as(u16, 1) << max_bits);
@@ -1255,40 +1325,35 @@ const huffman = struct {
         try std.testing.fuzz({}, checkFuzzedBuildFreqs, .{});
     }
 
-    fn checkFuzzedBuildFreqs(_: void, freqs: []const u8) !void {
+    fn checkFuzzedBuildFreqs(_: void, smith: *std.testing.Smith) !void {
         @disableInstrumentation();
-        var r: Io.Reader = .fixed(freqs);
         var freqs_limit: u16 = 65535;
         var freqs_buf: [max_leafs]u16 = undefined;
         var nfreqs: u15 = 0;
 
-        const params: packed struct(u8) {
-            max_bits: u4,
-            _: u3,
-            incomplete_allowed: bool,
-        } = @bitCast(r.takeByte() catch 255);
-        while (nfreqs != freqs_buf.len) {
-            const leb = r.takeLeb128(u16);
-            const f = if (leb) |f| @min(f, freqs_limit) else |e| switch (e) {
-                error.ReadFailed => unreachable,
-                error.EndOfStream => 0,
-                error.Overflow => freqs_limit,
-            };
+        const incomplete_allowed = smith.value(bool);
+        while (nfreqs < @as(u8, @intFromBool(!incomplete_allowed)) + 1 or
+            nfreqs != freqs_buf.len and freqs_limit != 0 and
+                smith.eosWeightedSimple(15, 1))
+        {
+            const f = smith.valueWeighted(u16, &.{
+                .rangeAtMost(u16, 0, @min(31, freqs_limit), @max(freqs_limit, 1)),
+                .rangeAtMost(u16, 0, freqs_limit, 1),
+            });
             freqs_buf[nfreqs] = f;
-            nfreqs += 1;
             freqs_limit -= f;
-            if (leb == error.EndOfStream and nfreqs - 1 > @intFromBool(params.incomplete_allowed))
-                break;
+            nfreqs += 1;
         }
 
         var codes_buf: [max_leafs]u16 = undefined;
         var bits_buf: [max_leafs]u4 = @splat(0);
+        const max_bits = smith.valueRangeAtMost(u4, math.log2_int_ceil(u15, nfreqs), 15);
         const total_bits, const last_nonzero = build(
             freqs_buf[0..nfreqs],
             codes_buf[0..nfreqs],
             bits_buf[0..nfreqs],
-            @max(math.log2_int_ceil(u15, nfreqs), params.max_bits),
-            params.incomplete_allowed,
+            max_bits,
+            incomplete_allowed,
         );
 
         var has_bitlen_one: bool = false;
@@ -1303,21 +1368,21 @@ const huffman = struct {
         }
 
         errdefer std.log.err(
-            \\ params: {}
+            \\ incomplete_allowed: {}
+            \\ max_bits: {}
             \\ freqs: {any}
             \\ bits: {any}
             \\ # freqs: {}
-            \\ max bits: {} 
             \\ weighted sum: {}
             \\ has_bitlen_one: {}
             \\ expected/actual total bits: {}/{}
             \\ expected/actual last nonzero: {?}/{}
         ++ "\n", .{
-            params,
+            incomplete_allowed,
+            max_bits,
             freqs_buf[0..nfreqs],
             bits_buf[0..nfreqs],
             nfreqs,
-            @max(math.log2_int_ceil(u15, nfreqs), params.max_bits),
             weighted_sum,
             has_bitlen_one,
             expected_total_bits,
@@ -1331,7 +1396,7 @@ const huffman = struct {
         if (weighted_sum > 1 << 15)
             return error.OversubscribedHuffmanTree;
         if (weighted_sum < 1 << 15 and
-            !(params.incomplete_allowed and has_bitlen_one and weighted_sum == 1 << 14))
+            !(incomplete_allowed and has_bitlen_one and weighted_sum == 1 << 14))
             return error.IncompleteHuffmanTree;
     }
 };
@@ -1353,6 +1418,7 @@ fn testingFreqBufs() !*[2][65536]u8 {
     }
     return fbufs;
 }
+const FreqBufIndex = enum(u1) { gradient, random };
 
 fn testingCheckDecompressedMatches(
     flate_bytes: []const u8,
@@ -1422,135 +1488,115 @@ const PackedContainer = packed struct(u2) {
 
 test Compress {
     const fbufs = try testingFreqBufs();
-    defer if (!builtin.fuzz) std.testing.allocator.destroy(fbufs);
+    defer std.testing.allocator.destroy(fbufs);
     try std.testing.fuzz(fbufs, testFuzzedCompressInput, .{});
 }
 
-fn testFuzzedCompressInput(fbufs: *const [2][65536]u8, input: []const u8) !void {
-    var in: Io.Reader = .fixed(input);
-    var opts: packed struct(u51) {
-        container: PackedContainer,
-        buf_size: u16,
-        good: u8,
-        nice: u8,
-        lazy: u8,
-        /// Not a `u16` to limit it for performance
-        chain: u9,
-    } = @bitCast(in.takeLeb128(u51) catch 0);
-    var expected_hash: flate.Container.Hasher = .init(opts.container.val());
+fn testFuzzedCompressInput(fbufs: *const [2][65536]u8, smith: *std.testing.Smith) !void {
+    @disableInstrumentation();
+    const container = smith.value(flate.Container);
+    const good = smith.valueRangeAtMost(u16, 3, 258);
+    const nice = smith.valueRangeAtMost(u16, 3, 258);
+    const lazy = smith.valueRangeAtMost(u16, 3, nice);
+    const chain = smith.valueWeighted(u16, &.{
+        .rangeAtMost(u16, if (good <= lazy) 4 else 1, 255, 65536),
+        // The following weights are greatly reduced since they increasing take more time to run
+        .rangeAtMost(u16, 256, 4095, 256),
+        .rangeAtMost(u16, 4096, 32767 + 256, 1),
+    });
+    var expected_hash: flate.Container.Hasher = .init(container);
     var expected_size: u32 = 0;
 
     var flate_buf: [128 * 1024]u8 = undefined;
     var flate_w: Writer = .fixed(&flate_buf);
     var deflate_buf: [flate.max_window_len * 2]u8 = undefined;
-    var deflate_w = try Compress.init(
-        &flate_w,
-        deflate_buf[0 .. flate.max_window_len + @as(usize, opts.buf_size)],
-        opts.container.val(),
-        .{
-            .good = @as(u16, opts.good) + 3,
-            .nice = @as(u16, opts.nice) + 3,
-            .lazy = @as(u16, @min(opts.lazy, opts.nice)) + 3,
-            .chain = @max(1, opts.chain, @as(u8, 4) * @intFromBool(opts.good <= opts.lazy)),
-        },
-    );
+    const bufsize = smith.valueRangeAtMost(u32, flate.max_window_len, @intCast(deflate_buf.len));
+    var deflate_w = try Compress.init(&flate_w, deflate_buf[0..bufsize], container, .{
+        .good = good,
+        .nice = nice,
+        .lazy = lazy,
+        .chain = chain,
+    });
 
-    // It is ensured that more bytes are not written then this to ensure this run
-    // does not take too long and that `flate_buf` does not run out of space.
-    const flate_buf_blocks = flate_buf.len / block_tokens;
-    // Allow a max overhead of 64 bytes per block since the implementation does not gaurauntee it
-    // writes store blocks when optimal. This comes from taking less than 32 bytes to write an
-    // optimal dynamic block header of mostly bitlen 8 codes and the end of block literal plus
-    // `(65536 / 256) / 8`, which is is the maximum number of extra bytes from bitlen 9 codes. An
-    // extra 32 bytes is reserved on top of that for container headers and footers.
-    const max_size = flate_buf.len - (flate_buf_blocks * 64 + 32);
-
-    while (true) {
-        const data: packed struct(u36) {
-            is_rebase: bool,
-            is_bytes: bool,
-            params: packed union {
-                copy: packed struct(u34) {
-                    len_lo: u5,
-                    dist: u15,
-                    len_hi: u4,
-                    _: u10,
-                },
-                bytes: packed struct(u34) {
-                    kind: enum(u1) { gradient, random },
-                    off_hi: u4,
-                    len_lo: u10,
-                    off_mi: u4,
-                    len_hi: u5,
-                    off_lo: u8,
-                    _: u2,
-                },
-                rebase: packed struct(u34) {
-                    preserve: u17,
-                    capacity: u17,
-                },
-            },
-        } = @bitCast(in.takeLeb128(u36) catch |e| switch (e) {
-            error.ReadFailed => unreachable,
-            error.Overflow => 0,
-            error.EndOfStream => break,
-        });
-
+    var max_output: usize = 32; // Headers / footer
+    while (!smith.eosWeightedSimple(7, 1)) {
         const buffered = deflate_w.writer.buffered();
         // Required for repeating patterns and since writing from `buffered` is illegal
         var copy_buf: [512]u8 = undefined;
 
-        if (data.is_rebase) {
-            const usable_capacity = deflate_w.writer.buffer.len - rebase_reserved_capacity;
-            const preserve = @min(data.params.rebase.preserve, usable_capacity);
-            const capacity = @min(data.params.rebase.capacity, usable_capacity -
-                @max(rebase_min_preserve, preserve));
-            try deflate_w.writer.rebase(preserve, capacity);
-            continue;
-        }
+        const bytes = bytes: switch (smith.valueRangeAtMost(
+            u2,
+            @intFromBool(buffered.len == 0),
+            3,
+        )) {
+            0 => { // Copy
+                const start = smith.valueRangeLessThan(u32, 0, @intCast(buffered.len));
+                // Reuse the implementation's history; otherwise, our own would need maintained.
+                const from = buffered[start..];
+                const len = smith.valueRangeAtMost(u16, 1, copy_buf.len);
 
-        const max_bytes = max_size -| expected_size;
-        const bytes = if (!data.is_bytes and buffered.len != 0) bytes: {
-            const dist = @min(buffered.len, @as(u32, data.params.copy.dist) + 1);
-            const len = @min(
-                @max(@shlExact(@as(u9, data.params.copy.len_hi), 5) | data.params.copy.len_lo, 1),
-                max_bytes,
-            );
-            // Reuse the implementation's history. Otherwise our own would need maintained.
-            const bytes_start = buffered[buffered.len - dist ..];
-            const history_bytes = bytes_start[0..@min(bytes_start.len, len)];
-
-            @memcpy(copy_buf[0..history_bytes.len], history_bytes);
-            const new_history = len - history_bytes.len;
-            if (history_bytes.len != len) for ( // check needed for `- dist`
-                copy_buf[history_bytes.len..][0..new_history],
-                copy_buf[history_bytes.len - dist ..][0..new_history],
-            ) |*next, prev| {
-                next.* = prev;
-            };
-            break :bytes copy_buf[0..len];
-        } else bytes: {
-            const off = @shlExact(@as(u16, data.params.bytes.off_hi), 12) |
-                @shlExact(@as(u16, data.params.bytes.off_mi), 8) |
-                data.params.bytes.off_lo;
-            const len = @shlExact(@as(u16, data.params.bytes.len_hi), 10) |
-                data.params.bytes.len_lo;
-            const fbuf = &fbufs[@intFromEnum(data.params.bytes.kind)];
-            break :bytes fbuf[off..][0..@min(len, fbuf.len - off, max_bytes)];
+                const history_bytes = from[0..@min(from.len, len)];
+                @memcpy(copy_buf[0..history_bytes.len], history_bytes);
+                const repeat_len = len - history_bytes.len;
+                for (
+                    copy_buf[history_bytes.len..][0..repeat_len],
+                    copy_buf[0..repeat_len],
+                ) |*next, prev| {
+                    next.* = prev;
+                }
+                break :bytes copy_buf[0..len];
+            },
+            1 => { // Bytes
+                const fbuf = &fbufs[
+                    smith.valueWeighted(u1, &.{
+                        .value(FreqBufIndex, .gradient, 3),
+                        .value(FreqBufIndex, .random, 1),
+                    })
+                ];
+                const len = smith.valueRangeAtMost(u32, 1, fbuf.len);
+                const off = smith.valueRangeAtMost(u32, 0, @intCast(fbuf.len - len));
+                break :bytes fbuf[off..][0..len];
+            },
+            2 => { // Rebase
+                const rebaseable = bufsize - rebase_reserved_capacity;
+                const capacity = smith.valueRangeAtMost(u32, 1, rebaseable - rebase_min_preserve);
+                const preserve = smith.valueRangeAtMost(u32, 0, rebaseable - capacity);
+                const failed = deflate_w.writer.rebase(preserve, capacity);
+                if (flate_w.buffered().len > max_output) return error.OverheadTooLarge;
+                failed catch return; // Wrote too much data and ran out of space
+                continue;
+            },
+            3 => { // Flush
+                max_output += 8; // Alignment data
+                const failed = deflate_w.writer.flush();
+                if (flate_w.buffered().len > max_output) return error.OverheadTooLarge;
+                failed catch return; // Wrote too much data and ran out of space
+                continue;
+            },
         };
-        assert(bytes.len <= max_bytes);
-        try deflate_w.writer.writeAll(bytes);
+
+        // An overhead of 64 bytes is given for each block since the implementation does not
+        // gaurauntee it writes store blocks when optimal. This comes from taking less than 32
+        // bytes to write an optimal dynamic block header of mostly bitlen 8 codes and the end
+        // of block literal plus `(65536 / 256) / 8`, which is is the maximum number of extra
+        // bytes from bitlen 9 codes.
+        max_output += bytes.len + ((bytes.len + flate_buf.len - 1) / block_tokens) * 64;
+        const failed = deflate_w.writer.writeAll(bytes);
+        if (flate_w.buffered().len > max_output) return error.OverheadTooLarge;
+        failed catch return; // Wrote too much data and ran out of space
         expected_hash.update(bytes);
         expected_size += @intCast(bytes.len);
     }
 
-    try deflate_w.writer.flush();
+    const failed = deflate_w.finish();
+    if (flate_w.buffered().len > max_output) return error.OverheadTooLarge;
+    failed catch return; // Wrote too much data and ran out of space
     try testingCheckDecompressedMatches(flate_w.buffered(), expected_size, expected_hash);
 }
 
 /// Does not compress data
 pub const Raw = struct {
-    /// After `flush` is called, all vtable calls with result in `error.WriteFailed.`
+    /// After `finish` is called, all vtable calls with result in `error.WriteFailed`.
     writer: Writer,
     output: *Writer,
     hasher: flate.Container.Hasher,
@@ -1693,8 +1739,12 @@ pub const Raw = struct {
     }
 
     fn flush(w: *Writer) Writer.Error!void {
-        defer w.* = .failing;
-        try Raw.rebaseInner(w, 0, w.buffer.len, true);
+        errdefer w.* = .failing;
+        try Raw.rebaseInner(w, 0, w.buffer.len, false);
+    }
+
+    fn finish(r: *Raw) Writer.Error!void {
+        try Raw.rebaseInner(&r.writer, 0, r.writer.buffer.len, true);
     }
 
     fn rebase(w: *Writer, preserve: usize, capacity: usize) Writer.Error!void {
@@ -1768,7 +1818,7 @@ pub const Raw = struct {
 
 test Raw {
     const data_buf = try std.testing.allocator.create([4 * 65536]u8);
-    defer if (!builtin.fuzz) std.testing.allocator.destroy(data_buf);
+    defer std.testing.allocator.destroy(data_buf);
     var prng: std.Random.DefaultPrng = .init(std.testing.random_seed);
     prng.random().bytes(data_buf);
     try std.testing.fuzz(data_buf, testFuzzedRawInput, .{});
@@ -1780,7 +1830,8 @@ fn countVec(data: []const []const u8) usize {
     return bytes;
 }
 
-fn testFuzzedRawInput(data_buf: *const [4 * 65536]u8, input: []const u8) !void {
+fn testFuzzedRawInput(data_buf: *const [4 * 65536]u8, smith: *std.testing.Smith) !void {
+    @disableInstrumentation();
     const HashedStoreWriter = struct {
         writer: Writer,
         state: enum {
@@ -1819,8 +1870,8 @@ fn testFuzzedRawInput(data_buf: *const [4 * 65536]u8, input: []const u8) !void {
 
         /// Note that this implementation is somewhat dependent on the implementation of
         /// `Raw` by expecting headers / footers to be continous in data elements. It
-        /// also expects the header to be the same as `flate.Container.header` and not
-        /// for multiple streams to be concatenated.
+        /// also expects the header to be the same as `flate.Container.header` and for
+        /// multiple streams to not be concatenated.
         fn drain(w: *Writer, data: []const []const u8, splat: usize) Writer.Error!usize {
             errdefer w.* = .failing;
             var h: *@This() = @fieldParentPtr("writer", w);
@@ -1909,102 +1960,116 @@ fn testFuzzedRawInput(data_buf: *const [4 * 65536]u8, input: []const u8) !void {
         }
 
         fn flush(w: *Writer) Writer.Error!void {
-            defer w.* = .failing; // Clears buffer even if state hasn't reached `end`
+            defer w.* = .failing; // Empties buffer even if state hasn't reached `end`
             _ = try @This().drain(w, &.{""}, 0);
         }
     };
 
-    var in: Io.Reader = .fixed(input);
-    const opts: packed struct(u19) {
-        container: PackedContainer,
-        buf_len: u17,
-    } = @bitCast(in.takeLeb128(u19) catch 0);
-    var output: HashedStoreWriter = .init(&.{}, opts.container.val());
-    var r_buf: [2 * 65536]u8 = undefined;
-    var r: Raw = try .init(
-        &output.writer,
-        r_buf[0 .. opts.buf_len +% flate.max_window_len],
-        opts.container.val(),
-    );
-
-    var data_base: u18 = 0;
-    var expected_hash: flate.Container.Hasher = .init(opts.container.val());
+    const container = smith.value(flate.Container);
+    var output: HashedStoreWriter = .init(&.{}, container);
+    var expected_hash: flate.Container.Hasher = .init(container);
     var expected_size: u32 = 0;
+    // 10 maximum blocks is the choosen limit since it is two more
+    // than the maximum the implementation can output in one drain.
+    const max_size = 10 * @as(u32, Raw.max_block_size);
+
+    var raw_buf: [2 * @as(usize, Raw.max_block_size)]u8 = undefined;
+    const raw_buf_len = smith.valueWeighted(u32, &.{
+        .value(u32, 0, @intCast(raw_buf.len)), // unbuffered
+        .rangeAtMost(u32, 0, @intCast(raw_buf.len), 1),
+    });
+    var raw: Raw = try .init(&output.writer, raw_buf[0..raw_buf_len], container);
+
+    const data_buf_len: u32 = @intCast(data_buf.len);
     var vecs: [32][]const u8 = undefined;
     var vecs_n: usize = 0;
 
-    while (in.seek != in.end) {
-        const VecInfo = packed struct(u58) {
-            output: bool,
-            /// If set, `data_len` and `splat` are reinterpreted as `capacity`
-            /// and `preserve_len` respectively and `output` is treated as set.
-            rebase: bool,
-            block_aligning_len: bool,
-            block_aligning_splat: bool,
-            data_len: u18,
-            splat: u18,
-            data_off: u18,
+    while (true) {
+        const Op = packed struct {
+            drain: bool = false,
+            add_vec: bool = false,
+            rebase: enum(u2) { none, rebase, flush } = .none,
+
+            pub const drain_only: @This() = .{ .drain = true };
+            pub const add_vec_only: @This() = .{ .add_vec = true };
+            pub const add_vec_and_drain: @This() = .{ .add_vec = true, .drain = true };
+            pub const drain_and_rebase: @This() = .{ .drain = true, .rebase = .rebase };
+            pub const drain_and_flush: @This() = .{ .drain = true, .rebase = .flush };
         };
-        var vec_info: VecInfo = @bitCast(in.takeLeb128(u58) catch |e| switch (e) {
-            error.ReadFailed => unreachable,
-            error.Overflow, error.EndOfStream => 0,
-        });
 
-        {
-            const buffered = r.writer.buffered().len + countVec(vecs[0..vecs_n]);
-            const to_align = mem.alignForwardAnyAlign(usize, buffered, Raw.max_block_size) - buffered;
-            assert((buffered + to_align) % Raw.max_block_size == 0);
+        const is_eos = expected_size == max_size or smith.eosWeightedSimple(7, 1);
+        var op: Op = if (!is_eos) smith.valueWeighted(Op, &.{
+            .value(Op, .add_vec_only, 5),
+            .value(Op, .add_vec_and_drain, 1),
+            .value(Op, .drain_and_rebase, 1),
+            .value(Op, .drain_and_flush, 1),
+        }) else .drain_only;
 
-            if (vec_info.block_aligning_len) {
-                vec_info.data_len = @intCast(to_align);
-            } else if (vec_info.block_aligning_splat and vec_info.data_len != 0 and
-                to_align % vec_info.data_len == 0)
-            {
-                vec_info.splat = @divExact(@as(u18, @intCast(to_align)), vec_info.data_len) -% 1;
-            }
-        }
+        if (op.add_vec) {
+            const max_write = max_size - expected_size;
+            const buffered: u32 = @intCast(raw.writer.buffered().len + countVec(vecs[0..vecs_n]));
+            const to_align = Raw.max_block_size - buffered % Raw.max_block_size;
+            assert(to_align != 0); // otherwise, not helpful.
 
-        var splat = if (vec_info.output and !vec_info.rebase) vec_info.splat +% 1 else 1;
-        add_vec: {
-            if (vec_info.rebase) break :add_vec;
-            if (expected_size +| math.mulWide(u18, vec_info.data_len, splat) >
-                10 * (1 << 16))
-            {
-                // Skip this vector to avoid this test taking too long.
-                // 10 maximum sized blocks is choosen as the limit since it is two more
-                // than the maximum the implementation can output in one drain.
-                splat = 1;
-                break :add_vec;
-            }
+            const max_data = @min(data_buf_len, max_write);
+            const len = smith.valueWeighted(u32, &.{
+                .rangeAtMost(u32, 0, max_data, 1),
+                .rangeAtMost(u32, 0, @min(Raw.max_block_size, max_data), 4),
+                .value(u32, @min(to_align, max_data), max_data), // @min 2nd arg is an edge-case
+            });
+            const off = smith.valueRangeAtMost(u32, 0, data_buf_len - len);
 
-            vecs[vecs_n] = data_buf[@min(
-                data_base +% vec_info.data_off,
-                data_buf.len - vec_info.data_len,
-            )..][0..vec_info.data_len];
-
-            data_base +%= vec_info.data_len +% 3; // extra 3 to help catch aliasing bugs
-
-            for (0..splat) |_| expected_hash.update(vecs[vecs_n]);
-            expected_size += @as(u32, @intCast(vecs[vecs_n].len)) * splat;
+            expected_size += len;
+            vecs[vecs_n] = data_buf[off..][0..len];
             vecs_n += 1;
+            op.drain |= vecs_n == vecs.len;
         }
 
-        const want_drain = vecs_n == vecs.len or vec_info.output or vec_info.rebase or
-            in.seek == in.end;
-        if (want_drain and vecs_n != 0) {
-            try r.writer.writeSplatAll(vecs[0..vecs_n], splat);
+        op.drain |= is_eos;
+        op.drain &= vecs_n != 0;
+        if (op.drain) {
+            const pattern_len: u32 = @intCast(vecs[vecs_n - 1].len);
+            const pattern_len_z = @max(pattern_len, 1);
+
+            const max_write = max_size - (expected_size - pattern_len);
+            const buffered: u32 = @intCast(raw.writer.buffered().len + countVec(vecs[0 .. vecs_n - 1]));
+            const to_align = Raw.max_block_size - buffered % Raw.max_block_size;
+            assert(to_align != 0); // otherwise, not helpful.
+
+            const max_splat = max_write / pattern_len_z;
+            const weights: [3]std.testing.Smith.Weight = .{
+                .rangeAtMost(u32, 0, max_splat, 1),
+                .rangeAtMost(u32, 0, @min(
+                    Raw.max_block_size + pattern_len_z,
+                    max_write,
+                ) / pattern_len_z, 4),
+                .value(u32, to_align / pattern_len_z, max_splat * 4),
+            };
+            const align_weight = to_align % pattern_len_z == 0 and to_align <= max_write;
+            const n_weights = @as(u8, 2) + @intFromBool(align_weight);
+            const splat = smith.valueWeighted(u32, weights[0..n_weights]);
+
+            expected_size = expected_size - pattern_len + pattern_len * splat; // splat may be zero
+            for (vecs[0 .. vecs_n - 1]) |v| expected_hash.update(v);
+            for (0..splat) |_| expected_hash.update(vecs[vecs_n - 1]);
+            try raw.writer.writeSplatAll(vecs[0..vecs_n], splat);
             vecs_n = 0;
-        } else assert(splat == 1);
-
-        if (vec_info.rebase) {
-            try r.writer.rebase(vec_info.data_len, @min(
-                r.writer.buffer.len -| vec_info.data_len,
-                vec_info.splat,
-            ));
         }
+
+        switch (op.rebase) {
+            .none => {},
+            .rebase => {
+                const capacity = smith.valueRangeAtMost(u32, 0, raw_buf_len);
+                const preserve = smith.valueRangeAtMost(u32, 0, raw_buf_len - capacity);
+                try raw.writer.rebase(preserve, capacity);
+            },
+            .flush => try raw.writer.flush(),
+        }
+
+        if (is_eos) break;
     }
 
-    try r.writer.flush();
+    try raw.finish();
     try output.writer.flush();
 
     try std.testing.expectEqual(.end, output.state);
@@ -2027,6 +2092,7 @@ fn testFuzzedRawInput(data_buf: *const [4 * 65536]u8, input: []const u8) !void {
 
 /// Only performs huffman compression on data, does no matching.
 pub const Huffman = struct {
+    /// After `finish` is called, all vtable calls with result in `error.WriteFailed`.
     writer: Writer,
     bit_writer: BitWriter,
     hasher: flate.Container.Hasher,
@@ -2056,12 +2122,6 @@ pub const Huffman = struct {
     }
 
     fn drain(w: *Writer, data: []const []const u8, splat: usize) Writer.Error!usize {
-        {
-            //std.debug.print("drain {} (buffered)", .{w.buffered().len});
-            //for (data) |d| std.debug.print("\n\t+ {}", .{d.len});
-            //std.debug.print(" x {}\n\n", .{splat});
-        }
-
         const h: *Huffman = @fieldParentPtr("writer", w);
         const min_block = @min(w.buffer.len, max_tokens);
         const pattern = data[data.len - 1];
@@ -2268,9 +2328,15 @@ pub const Huffman = struct {
     }
 
     fn flush(w: *Writer) Writer.Error!void {
-        defer w.* = .failing;
+        errdefer w.* = .failing;
         const h: *Huffman = @fieldParentPtr("writer", w);
-        try Huffman.rebaseInner(w, 0, w.buffer.len, true);
+        try Huffman.rebaseInner(w, 0, w.buffer.len, false);
+        try h.bit_writer.byteAlignBlocks();
+    }
+
+    fn finish(h: *Huffman) Writer.Error!void {
+        defer h.writer = .failing;
+        try Huffman.rebaseInner(&h.writer, 0, h.writer.buffer.len, true);
         try h.bit_writer.output.rebase(0, 1);
         h.bit_writer.byteAlign();
         try h.hasher.writeFooter(h.bit_writer.output);
@@ -2389,9 +2455,6 @@ pub const Huffman = struct {
             break :n stored_align_bits + @as(u32, 32) + @as(u32, bytes) * 8;
         };
 
-        //std.debug.print("@ {}{{{}}} ", .{ h.bit_writer.output.end, h.bit_writer.buffered_n });
-        //std.debug.print("#{} -> s {} f {} d {}\n", .{ bytes, stored_bitsize, fixed_bitsize, dynamic_bitsize });
-
         if (stored_bitsize <= @min(dynamic_bitsize, fixed_bitsize)) {
             try h.bit_writer.write(BlockHeader.int(.{ .kind = .stored, .final = eos }), 3);
             try h.bit_writer.output.rebase(0, 5);
@@ -2428,124 +2491,156 @@ pub const Huffman = struct {
 
 test Huffman {
     const fbufs = try testingFreqBufs();
-    defer if (!builtin.fuzz) std.testing.allocator.destroy(fbufs);
+    defer std.testing.allocator.destroy(fbufs);
     try std.testing.fuzz(fbufs, testFuzzedHuffmanInput, .{});
 }
 
+fn fuzzedHuffmanDrainSpaceLimit(max_drain: usize, written: usize, eos: bool) usize {
+    var block_lim = math.divCeil(usize, max_drain, Huffman.max_tokens) catch unreachable;
+    block_lim = @max(block_lim, @intFromBool(eos));
+    const footer_overhead = @as(u8, 8) * @intFromBool(eos);
+    // 6 for a raw block header (the block header may span two bytes)
+    return written + 6 * block_lim + max_drain + footer_overhead;
+}
+
 /// This function is derived from `testFuzzedRawInput` with a few changes for fuzzing `Huffman`.
-fn testFuzzedHuffmanInput(fbufs: *const [2][65536]u8, input: []const u8) !void {
-    var in: Io.Reader = .fixed(input);
-    const opts: packed struct(u19) {
-        container: PackedContainer,
-        buf_len: u17,
-    } = @bitCast(in.takeLeb128(u19) catch 0);
+fn testFuzzedHuffmanInput(fbufs: *const [2][65536]u8, smith: *std.testing.Smith) !void {
+    @disableInstrumentation();
+    const container = smith.value(flate.Container);
     var flate_buf: [2 * 65536]u8 = undefined;
     var flate_w: Writer = .fixed(&flate_buf);
-    var h_buf: [2 * 65536]u8 = undefined;
-    var h: Huffman = try .init(
-        &flate_w,
-        h_buf[0 .. opts.buf_len +% flate.max_window_len],
-        opts.container.val(),
-    );
-
-    var expected_hash: flate.Container.Hasher = .init(opts.container.val());
+    var expected_hash: flate.Container.Hasher = .init(container);
     var expected_size: u32 = 0;
+    const max_size = 4 * @as(u32, Huffman.max_tokens);
+
+    var h_buf: [2 * @as(usize, Huffman.max_tokens)]u8 = undefined;
+    const h_buf_len = smith.valueWeighted(u32, &.{
+        .value(u32, 0, @intCast(h_buf.len)), // unbuffered
+        .rangeAtMost(u32, 0, @intCast(h_buf.len), 1),
+    });
+    var h: Huffman = try .init(&flate_w, h_buf[0..h_buf_len], container);
+
     var vecs: [32][]const u8 = undefined;
     var vecs_n: usize = 0;
 
-    while (in.seek != in.end) {
-        const VecInfo = packed struct(u55) {
-            output: bool,
-            /// If set, `data_len` and `splat` are reinterpreted as `capacity`
-            /// and `preserve_len` respectively and `output` is treated as set.
-            rebase: bool,
-            block_aligning_len: bool,
-            block_aligning_splat: bool,
-            data_off_hi: u8,
-            random_data: u1,
-            data_len: u16,
-            splat: u18,
-            /// This is less useful as each value is part of the same gradient 'step'
-            data_off_lo: u8,
+    while (true) {
+        const Op = packed struct {
+            drain: bool = false,
+            add_vec: bool = false,
+            rebase: enum(u2) { none, rebase, flush } = .none,
+
+            pub const drain_only: @This() = .{ .drain = true };
+            pub const add_vec_only: @This() = .{ .add_vec = true };
+            pub const add_vec_and_drain: @This() = .{ .add_vec = true, .drain = true };
+            pub const drain_and_rebase: @This() = .{ .drain = true, .rebase = .rebase };
+            pub const drain_and_flush: @This() = .{ .drain = true, .rebase = .flush };
         };
-        var vec_info: VecInfo = @bitCast(in.takeLeb128(u55) catch |e| switch (e) {
-            error.ReadFailed => unreachable,
-            error.Overflow, error.EndOfStream => 0,
-        });
 
-        {
-            const buffered = h.writer.buffered().len + countVec(vecs[0..vecs_n]);
-            const to_align = mem.alignForwardAnyAlign(usize, buffered, Huffman.max_tokens) - buffered;
-            assert((buffered + to_align) % Huffman.max_tokens == 0);
+        const is_eos = expected_size == max_size or smith.eosWeightedSimple(7, 1);
+        var op: Op = if (!is_eos) smith.valueWeighted(Op, &.{
+            .value(Op, .add_vec_only, 5),
+            .value(Op, .add_vec_and_drain, 1),
+            .value(Op, .drain_and_rebase, 1),
+            .value(Op, .drain_and_flush, 1),
+        }) else .drain_only;
 
-            if (vec_info.block_aligning_len) {
-                vec_info.data_len = @intCast(to_align);
-            } else if (vec_info.block_aligning_splat and vec_info.data_len != 0 and
-                to_align % vec_info.data_len == 0)
-            {
-                vec_info.splat = @divExact(@as(u18, @intCast(to_align)), vec_info.data_len) -% 1;
-            }
-        }
+        if (op.add_vec) {
+            const max_write = max_size - expected_size;
+            const buffered: u32 = @intCast(h.writer.buffered().len + countVec(vecs[0..vecs_n]));
+            const to_align = Huffman.max_tokens - buffered % Huffman.max_tokens;
+            assert(to_align != 0); // otherwise, not helpful.
 
-        var splat = if (vec_info.output and !vec_info.rebase) vec_info.splat +% 1 else 1;
-        add_vec: {
-            if (vec_info.rebase) break :add_vec;
-            if (expected_size +| math.mulWide(u18, vec_info.data_len, splat) > 4 * (1 << 16)) {
-                // Skip this vector to avoid this test taking too long.
-                splat = 1;
-                break :add_vec;
-            }
+            const data_buf = &fbufs[
+                smith.valueWeighted(u1, &.{
+                    .value(FreqBufIndex, .gradient, 3),
+                    .value(FreqBufIndex, .random, 1),
+                })
+            ];
+            const data_buf_len: u32 = @intCast(data_buf.len);
 
-            const data_buf = &fbufs[vec_info.random_data];
-            vecs[vecs_n] = data_buf[@min(
-                (@as(u16, vec_info.data_off_hi) << 8) | vec_info.data_off_lo,
-                data_buf.len - vec_info.data_len,
-            )..][0..vec_info.data_len];
+            const max_data = @min(data_buf_len, max_write);
+            const len = smith.valueWeighted(u32, &.{
+                .rangeAtMost(u32, 0, max_data, 1),
+                .rangeAtMost(u32, 0, @min(Huffman.max_tokens, max_data), 4),
+                .value(u32, @min(to_align, max_data), max_data), // @min 2nd arg is an edge-case
+            });
+            const off = smith.valueRangeAtMost(u32, 0, data_buf_len - len);
 
-            for (0..splat) |_| expected_hash.update(vecs[vecs_n]);
-            expected_size += @as(u32, @intCast(vecs[vecs_n].len)) * splat;
+            expected_size += len;
+            vecs[vecs_n] = data_buf[off..][0..len];
             vecs_n += 1;
+            op.drain |= vecs_n == vecs.len;
         }
 
-        const want_drain = vecs_n == vecs.len or vec_info.output or vec_info.rebase or
-            in.seek == in.end;
-        if (want_drain and vecs_n != 0) {
-            var n = h.writer.buffered().len + Writer.countSplat(vecs[0..vecs_n], splat);
-            const oos = h.writer.writeSplatAll(vecs[0..vecs_n], splat) == error.WriteFailed;
-            n -= h.writer.buffered().len;
-            const block_lim = math.divCeil(usize, n, Huffman.max_tokens) catch unreachable;
-            const lim = flate_w.end + 6 * block_lim + n; // 6 since block header may span two bytes
-            if (flate_w.end > lim) return error.OverheadTooLarge;
-            if (oos) return;
+        op.drain |= is_eos;
+        op.drain &= vecs_n != 0;
+        if (op.drain) {
+            const pattern_len: u32 = @intCast(vecs[vecs_n - 1].len);
+            const pattern_len_z = @max(pattern_len, 1);
+
+            const max_write = max_size - (expected_size - pattern_len);
+            const buffered: u32 = @intCast(h.writer.buffered().len + countVec(vecs[0 .. vecs_n - 1]));
+            const to_align = Huffman.max_tokens - buffered % Huffman.max_tokens;
+            assert(to_align != 0); // otherwise, not helpful.
+
+            const max_splat = max_write / pattern_len_z;
+            const weights: [3]std.testing.Smith.Weight = .{
+                .rangeAtMost(u32, 0, max_splat, 1),
+                .rangeAtMost(u32, 0, @min(
+                    Huffman.max_tokens + pattern_len_z,
+                    max_write,
+                ) / pattern_len_z, 4),
+                .value(u32, to_align / pattern_len_z, max_splat * 4),
+            };
+            const align_weight = to_align % pattern_len_z == 0 and to_align <= max_write;
+            const n_weights = @as(u8, 2) + @intFromBool(align_weight);
+            const splat = smith.valueWeighted(u32, weights[0..n_weights]);
+
+            expected_size = expected_size - pattern_len + pattern_len * splat; // splat may be zero
+            for (vecs[0 .. vecs_n - 1]) |v| expected_hash.update(v);
+            for (0..splat) |_| expected_hash.update(vecs[vecs_n - 1]);
+
+            const max_space = fuzzedHuffmanDrainSpaceLimit(
+                buffered + pattern_len * splat,
+                flate_w.buffered().len,
+                false,
+            );
+            h.writer.writeSplatAll(vecs[0..vecs_n], splat) catch
+                return if (max_space <= flate_w.buffer.len) error.OverheadTooLarge else {};
+            if (flate_w.buffered().len > max_space) return error.OverheadTooLarge;
 
             vecs_n = 0;
-        } else assert(splat == 1);
-
-        if (vec_info.rebase) {
-            const old_end = flate_w.end;
-            var n = h.writer.buffered().len;
-            const oos = h.writer.rebase(vec_info.data_len, @min(
-                h.writer.buffer.len -| vec_info.data_len,
-                vec_info.splat,
-            )) == error.WriteFailed;
-            n -= h.writer.buffered().len;
-            const block_lim = math.divCeil(usize, n, Huffman.max_tokens) catch unreachable;
-            const lim = old_end + 6 * block_lim + n; // 6 since block header may span two bytes
-            if (flate_w.end > lim) return error.OverheadTooLarge;
-            if (oos) return;
         }
+
+        if (op.rebase != .none) {
+            const capacity = smith.valueRangeAtMost(u32, 0, h_buf_len);
+            const preserve = smith.valueRangeAtMost(u32, 0, h_buf_len - capacity);
+
+            const max_space = fuzzedHuffmanDrainSpaceLimit(
+                h.writer.buffered().len,
+                flate_w.buffered().len,
+                false,
+            ) + @as(usize, 8) * @intFromBool(op.rebase == .flush); // Overhead from byte alignment
+            switch (op.rebase) {
+                .none => unreachable,
+                .rebase => h.writer.rebase(preserve, capacity) catch
+                    return if (max_space <= flate_w.buffer.len) error.OverheadTooLarge else {},
+                .flush => h.writer.flush() catch
+                    return if (max_space <= flate_w.buffer.len) error.OverheadTooLarge else {},
+            }
+            if (flate_w.buffered().len > max_space) return error.OverheadTooLarge;
+        }
+
+        if (is_eos) break;
     }
 
-    {
-        const old_end = flate_w.end;
-        const n = h.writer.buffered().len;
-        const oos = h.writer.flush() == error.WriteFailed;
-        assert(h.writer.buffered().len == 0);
-        const block_lim = @max(1, math.divCeil(usize, n, Huffman.max_tokens) catch unreachable);
-        const lim = old_end + 6 * block_lim + n + opts.container.val().footerSize();
-        if (flate_w.end > lim) return error.OverheadTooLarge;
-        if (oos) return;
-    }
+    const max_space = fuzzedHuffmanDrainSpaceLimit(
+        h.writer.buffered().len,
+        flate_w.buffered().len,
+        true,
+    );
+    h.finish() catch return if (max_space <= flate_w.buffer.len) error.OverheadTooLarge else {};
+    if (flate_w.buffered().len > max_space) return error.OverheadTooLarge;
 
     try testingCheckDecompressedMatches(flate_w.buffered(), expected_size, expected_hash);
 }

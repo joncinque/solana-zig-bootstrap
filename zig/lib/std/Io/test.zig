@@ -85,6 +85,28 @@ test "File.Writer.seekTo" {
     try expect(fw.logicalPos() == 1234);
 }
 
+test "file discard" {
+    var tmp = tmpDir(.{});
+    defer tmp.cleanup();
+
+    const io = testing.io;
+
+    const tmp_file_name = "temp_test_file.txt";
+    var file = try tmp.dir.createFile(io, tmp_file_name, .{ .read = true });
+    defer file.close(io);
+
+    var fw = file.writerStreaming(io, &.{});
+
+    try fw.interface.writeAll("test");
+
+    var fr = file.reader(io, &.{});
+    const r = &fr.interface;
+
+    try std.testing.expectEqual(error.EndOfStream, r.discardAll(1024));
+    try fr.seekTo(0);
+    try std.testing.expectEqual(4, fr.interface.discardRemaining());
+}
+
 test "File.setLength" {
     const io = testing.io;
 
@@ -216,14 +238,12 @@ test "Group.cancel" {
             defer result.* = 1;
             io.sleep(.fromSeconds(100_000), .awake) catch |err| switch (err) {
                 error.Canceled => |e| return e,
-                else => {},
             };
         }
 
         fn sleepRecancel(io: Io, result: *usize) void {
             io.sleep(.fromSeconds(100_000), .awake) catch |err| switch (err) {
                 error.Canceled => io.recancel(),
-                else => {},
             };
             result.* = 1;
         }
@@ -257,8 +277,6 @@ test "Group.cancel" {
 }
 
 test "Group.concurrent" {
-    if (builtin.os.tag == .linux and !builtin.link_libc) return error.SkipZigTest; // https://codeberg.org/ziglang/zig/issues/30096
-
     const io = testing.io;
 
     var group: Io.Group = .init;
@@ -267,14 +285,14 @@ test "Group.concurrent" {
 
     group.concurrent(io, count, .{ 1, 10, &results[0] }) catch |err| switch (err) {
         error.ConcurrencyUnavailable => {
-            try testing.expect(builtin.single_threaded);
+            try expect(builtin.single_threaded);
             return;
         },
     };
 
     group.concurrent(io, count, .{ 20, 30, &results[1] }) catch |err| switch (err) {
         error.ConcurrencyUnavailable => {
-            try testing.expect(builtin.single_threaded);
+            try expect(builtin.single_threaded);
             return;
         },
     };
@@ -284,38 +302,55 @@ test "Group.concurrent" {
     try testing.expectEqualSlices(usize, &.{ 45, 245 }, &results);
 }
 
-test "select" {
+test "Group materializes error.Cancel" {
+    const S = struct {
+        fn task() Io.Cancelable!void {
+            return error.Canceled;
+        }
+    };
+
     const io = testing.io;
 
-    var queue: Io.Queue(u8) = .init(&.{});
+    var group: Io.Group = .init;
 
-    var get_a = io.concurrent(Io.Queue(u8).getOne, .{ &queue, io }) catch |err| switch (err) {
+    group.async(io, S.task, .{});
+    group.concurrent(io, S.task, .{}) catch |err| switch (err) {
         error.ConcurrencyUnavailable => {
-            try testing.expect(builtin.single_threaded);
+            try expect(builtin.single_threaded);
             return;
         },
     };
-    defer _ = get_a.cancel(io) catch {};
 
-    var get_b = try io.concurrent(Io.Queue(u8).getOne, .{ &queue, io });
-    defer _ = get_b.cancel(io) catch {};
+    try group.await(io);
+}
 
-    var timeout = io.async(Io.sleep, .{ io, .fromMilliseconds(1), .awake });
-    defer timeout.cancel(io) catch {};
+test "Group task receives cancelation unknowingly" {
+    const S = struct {
+        io: Io,
+        err: ?Io.Cancelable!void,
 
-    switch (try io.select(.{
-        .get_a = &get_a,
-        .get_b = &get_b,
-        .timeout = &timeout,
-    })) {
-        .get_a => return error.TestFailure,
-        .get_b => return error.TestFailure,
-        .timeout => {
-            queue.close(io);
-            try testing.expectError(error.Closed, get_a.await(io));
-            try testing.expectError(error.Closed, get_b.await(io));
+        fn task(s: *@This()) void {
+            foo(s);
+        }
+
+        fn foo(s: *@This()) void {
+            s.err = s.io.sleep(.fromSeconds(300), .awake);
+        }
+    };
+
+    const io = testing.io;
+
+    var group: Io.Group = .init;
+    var result: S = .{ .io = io, .err = null };
+    group.concurrent(io, S.task, .{&result}) catch |err| switch (err) {
+        error.ConcurrencyUnavailable => {
+            try expect(builtin.single_threaded);
+            return;
         },
-    }
+    };
+    group.cancel(io);
+
+    try expectError(error.Canceled, result.err.?);
 }
 
 fn testQueue(comptime len: usize) !void {
@@ -523,8 +558,6 @@ test "cancel sleep" {
         fn blockUntilCanceled(io: Io) void {
             while (true) io.sleep(.fromSeconds(100_000), .awake) catch |err| switch (err) {
                 error.Canceled => return,
-                error.UnsupportedClock => @panic("unsupported clock"),
-                error.Unexpected => @panic("unexpected"),
             };
         }
     };
@@ -552,8 +585,6 @@ test "tasks spawned in group after Group.cancel are canceled" {
         fn blockUntilCanceled(io: Io) Io.Cancelable!void {
             while (true) io.sleep(.fromSeconds(100_000), .awake) catch |err| switch (err) {
                 error.Canceled => |e| return e,
-                error.UnsupportedClock => @panic("unsupported clock"),
-                error.Unexpected => @panic("unexpected"),
             };
         }
     };
@@ -581,7 +612,7 @@ test "random" {
     io.random(@ptrCast(&b));
     io.random(@ptrCast(&c));
 
-    try std.testing.expect(a ^ b ^ c != 0);
+    try expect(a ^ b ^ c != 0);
 }
 
 test "randomSecure" {
@@ -643,11 +674,300 @@ test "memory mapping" {
         try expectEqualStrings("this9is9my", mm.memory);
 
         // Cross a page boundary to require an actual remap.
-        try mm.setLength(io, .{
-            .len = std.heap.pageSize() * 2,
-        });
+        const new_len = std.heap.pageSize() * 2;
+        mm.setLength(io, new_len) catch |err| switch (err) {
+            error.OperationUnsupported => {
+                mm.destroy(io);
+                mm = try file.createMemoryMap(io, .{ .len = new_len });
+            },
+            else => |e| return e,
+        };
         try mm.read(io);
 
         try expectEqualStrings("this9is9my data123\x00\x00", mm.memory[0.."this9is9my data123\x00\x00".len]);
     }
+}
+
+test "read from a file using Batch.awaitAsync API" {
+    const io = testing.io;
+
+    var tmp = tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "eyes.txt",
+        .data = "Heaven's been cheating the Hell out of me",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "saviour.txt",
+        .data = "Burn your thoughts, erase your will / to gods of suffering and tears",
+    });
+
+    var eyes_file = try tmp.dir.openFile(io, "eyes.txt", .{});
+    defer eyes_file.close(io);
+
+    var saviour_file = try tmp.dir.openFile(io, "saviour.txt", .{});
+    defer saviour_file.close(io);
+
+    var eyes_buf: [100]u8 = undefined;
+    var saviour_buf: [100]u8 = undefined;
+    var storage: [2]Io.Operation.Storage = undefined;
+    var batch: Io.Batch = .init(&storage);
+
+    // Tests add API because this provides coverage for both add and addAt.
+    try testing.expectEqual(0, batch.add(.{ .file_read_streaming = .{
+        .file = eyes_file,
+        .data = &.{&eyes_buf},
+    } }));
+    try testing.expectEqual(1, batch.add(.{ .file_read_streaming = .{
+        .file = saviour_file,
+        .data = &.{&saviour_buf},
+    } }));
+
+    // This API is supposed to *always* work even if the target has no
+    // concurrency primitives available.
+    try batch.awaitAsync(io);
+
+    while (batch.next()) |completion| {
+        switch (completion.index) {
+            0 => {
+                const n = try completion.result.file_read_streaming;
+                try expectEqualStrings(
+                    "Heaven's been cheating the Hell out of me"[0..n],
+                    eyes_buf[0..n],
+                );
+            },
+            1 => {
+                const n = try completion.result.file_read_streaming;
+                try expectEqualStrings(
+                    "Burn your thoughts, erase your will / to gods of suffering and tears"[0..n],
+                    saviour_buf[0..n],
+                );
+            },
+            else => return error.TestFailure,
+        }
+    }
+}
+
+test "Event smoke test" {
+    const io = testing.io;
+
+    var event: Io.Event = .unset;
+    try testing.expectEqual(false, event.isSet());
+
+    // make sure the event gets set
+    event.set(io);
+    try testing.expectEqual(true, event.isSet());
+
+    // make sure the event gets unset again
+    event.reset();
+    try testing.expectEqual(false, event.isSet());
+
+    // waits should timeout as there's no other thread to set the event
+    try testing.expectError(error.Timeout, event.waitTimeout(io, .{ .duration = .{
+        .raw = .zero,
+        .clock = .awake,
+    } }));
+    try testing.expectError(error.Timeout, event.waitTimeout(io, .{ .duration = .{
+        .raw = .fromMilliseconds(1),
+        .clock = .awake,
+    } }));
+
+    // set the event again and make sure waits complete
+    event.set(io);
+    try event.wait(io);
+    try event.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(1), .clock = .awake } });
+    try testing.expectEqual(true, event.isSet());
+}
+
+test "Event signaling" {
+    if (builtin.single_threaded) {
+        // This test requires spawning threads.
+        return error.SkipZigTest;
+    }
+
+    const io = testing.io;
+
+    const Context = struct {
+        in: Io.Event = .unset,
+        out: Io.Event = .unset,
+        value: usize = 0,
+
+        fn input(self: *@This()) !void {
+            // wait for the value to become 1
+            try self.in.wait(io);
+            self.in.reset();
+            try testing.expectEqual(self.value, 1);
+
+            // bump the value and wake up output()
+            self.value = 2;
+            self.out.set(io);
+
+            // wait for output to receive 2, bump the value and wake us up with 3
+            try self.in.wait(io);
+            self.in.reset();
+            try testing.expectEqual(self.value, 3);
+
+            // bump the value and wake up output() for it to see 4
+            self.value = 4;
+            self.out.set(io);
+        }
+
+        fn output(self: *@This()) !void {
+            // start with 0 and bump the value for input to see 1
+            try testing.expectEqual(self.value, 0);
+            self.value = 1;
+            self.in.set(io);
+
+            // wait for input to receive 1, bump the value to 2 and wake us up
+            try self.out.wait(io);
+            self.out.reset();
+            try testing.expectEqual(self.value, 2);
+
+            // bump the value to 3 for input to see (rhymes)
+            self.value = 3;
+            self.in.set(io);
+
+            // wait for input to bump the value to 4 and receive no more (rhymes)
+            try self.out.wait(io);
+            self.out.reset();
+            try testing.expectEqual(self.value, 4);
+        }
+    };
+
+    var ctx = Context{};
+
+    const thread = try std.Thread.spawn(.{}, Context.output, .{&ctx});
+    defer thread.join();
+
+    try ctx.input();
+}
+
+test "Event broadcast" {
+    if (builtin.single_threaded) {
+        // This test requires spawning threads.
+        return error.SkipZigTest;
+    }
+
+    const io = testing.io;
+
+    const num_threads = 10;
+    const Barrier = struct {
+        event: Io.Event = .unset,
+        counter: std.atomic.Value(usize) = std.atomic.Value(usize).init(num_threads),
+
+        fn wait(self: *@This()) !void {
+            if (self.counter.fetchSub(1, .acq_rel) == 1) {
+                self.event.set(io);
+            }
+            try self.event.wait(io);
+        }
+    };
+
+    const Context = struct {
+        start_barrier: Barrier = .{},
+        finish_barrier: Barrier = .{},
+
+        fn run(self: *@This()) !void {
+            try self.start_barrier.wait();
+            try self.finish_barrier.wait();
+        }
+    };
+
+    var ctx = Context{};
+    var threads: [num_threads - 1]std.Thread = undefined;
+
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Context.run, .{&ctx});
+    defer for (threads) |t| t.join();
+
+    try ctx.run();
+}
+
+test "Select" {
+    const S = struct {
+        fn foo() bool {
+            return true;
+        }
+
+        fn bar(io: Io) Io.Cancelable!void {
+            try io.sleep(.fromSeconds(300), .awake);
+        }
+
+        fn baz() error{Ignored}!u8 {
+            return 42;
+        }
+    };
+
+    const io = testing.io;
+
+    const U = union(enum) {
+        foo: bool,
+        bar: Io.Cancelable!void,
+        baz: error{Ignored}!u8,
+    };
+    var buffer: [4]U = undefined;
+    var select: Io.Select(U) = .init(io, &buffer);
+    defer _ = select.cancel();
+
+    select.async(.foo, S.foo, .{});
+    select.concurrent(.bar, S.bar, .{io}) catch |err| switch (err) {
+        error.ConcurrencyUnavailable => return error.SkipZigTest,
+    };
+
+    switch (try select.await()) {
+        .foo => {},
+        .bar => return error.TestFailed, // should be sleeping
+        .baz => return error.TestFailed, // not called yet
+    }
+    select.async(.foo, S.foo, .{});
+    select.async(.foo, S.foo, .{});
+
+    var finished_buffer: [3]U = undefined;
+    const finished = finished_buffer[0..try select.awaitMany(&finished_buffer, 2)];
+    try testing.expectEqualSlices(U, &.{ .{ .foo = true }, .{ .foo = true } }, finished);
+
+    select.async(.baz, S.baz, .{});
+
+    const result = switch (try select.await()) {
+        .baz => |n| try n,
+        .foo => return error.TestFailed, // not called
+        .bar => return error.TestFailed, // should be sleeping
+    };
+
+    try testing.expectEqual(42, result);
+}
+
+test "Select with empty buffer, no deadlock" {
+    const S = struct {
+        fn sleeper(io: Io, duration: Io.Duration) Io.Cancelable!void {
+            try io.sleep(duration, .awake);
+        }
+    };
+
+    const io = testing.io;
+
+    const U = union(enum) {
+        sleeper: Io.Cancelable!void,
+    };
+    var select: Io.Select(U) = .init(io, &.{});
+    defer select.cancelDiscard();
+
+    select.concurrent(.sleeper, S.sleeper, .{ io, .fromNanoseconds(1) }) catch |err| switch (err) {
+        error.ConcurrencyUnavailable => return error.SkipZigTest,
+    };
+    select.concurrent(.sleeper, S.sleeper, .{ io, .fromSeconds(600) }) catch |err| switch (err) {
+        error.ConcurrencyUnavailable => return error.SkipZigTest,
+    };
+    assert((try select.await()) == .sleeper);
+}
+
+test "Select.cancel with no tasks, no deadlock" {
+    const io = testing.io;
+
+    const U = union(enum) {
+        nothing: void,
+        also_nothing: void,
+    };
+    var select: Io.Select(U) = .init(io, &.{});
+    try expectEqual(null, select.cancel());
 }

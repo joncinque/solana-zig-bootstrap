@@ -208,7 +208,7 @@ pub fn genNav(cg: *CodeGen, do_codegen: bool) Error!void {
             try cg.args.ensureUnusedCapacity(gpa, fn_info.param_types.len);
             for (fn_info.param_types.get(ip)) |param_ty_index| {
                 const param_ty: Type = .fromInterned(param_ty_index);
-                if (!param_ty.hasRuntimeBitsIgnoreComptime(zcu)) continue;
+                if (!param_ty.hasRuntimeBits(zcu)) continue;
 
                 const param_type_id = try cg.resolveType(param_ty, .direct);
                 const arg_result_id = cg.module.allocId();
@@ -256,7 +256,7 @@ pub fn genNav(cg: *CodeGen, do_codegen: bool) Error!void {
         .global => {
             const key = ip.indexToKey(val.toIntern()).@"extern";
 
-            const storage_class = cg.module.storageClass(nav.getAddrspace());
+            const storage_class = cg.module.storageClass(nav.resolved.?.@"addrspace");
             assert(storage_class != .generic); // These should be instance globals
 
             const ty_id = try cg.resolveType(ty, .indirect);
@@ -314,64 +314,47 @@ pub fn genNav(cg: *CodeGen, do_codegen: bool) Error!void {
             try cg.module.debugName(result_id, nav.fqn.toSlice(ip));
         },
         .invocation_global => {
-            const maybe_init_val: ?Value = switch (ip.indexToKey(val.toIntern())) {
-                .func => unreachable,
-                .variable => |variable| .fromInterned(variable.init),
-                .@"extern" => null,
-                else => val,
-            };
-
             const ty_id = try cg.resolveType(ty, .indirect);
             const ptr_ty_id = try cg.module.ptrType(ty_id, .function);
 
-            if (maybe_init_val) |init_val| {
-                // TODO: Combine with resolveAnonDecl?
-                const void_ty_id = try cg.resolveType(.void, .direct);
-                const initializer_proto_ty_id = try cg.module.functionType(void_ty_id, &.{});
+            // TODO: Combine with resolveAnonDecl?
+            const void_ty_id = try cg.resolveType(.void, .direct);
+            const initializer_proto_ty_id = try cg.module.functionType(void_ty_id, &.{});
 
-                const initializer_id = cg.module.allocId();
-                try cg.prologue.emit(gpa, .OpFunction, .{
-                    .id_result_type = try cg.resolveType(.void, .direct),
-                    .id_result = initializer_id,
-                    .function_control = .{},
-                    .function_type = initializer_proto_ty_id,
-                });
+            const initializer_id = cg.module.allocId();
+            try cg.prologue.emit(gpa, .OpFunction, .{
+                .id_result_type = try cg.resolveType(.void, .direct),
+                .id_result = initializer_id,
+                .function_control = .{},
+                .function_type = initializer_proto_ty_id,
+            });
 
-                const root_block_id = cg.module.allocId();
-                try cg.prologue.emit(gpa, .OpLabel, .{
-                    .id_result = root_block_id,
-                });
-                cg.block_label = root_block_id;
+            const root_block_id = cg.module.allocId();
+            try cg.prologue.emit(gpa, .OpLabel, .{
+                .id_result = root_block_id,
+            });
+            cg.block_label = root_block_id;
 
-                const val_id = try cg.constant(ty, init_val, .indirect);
-                try cg.body.emit(gpa, .OpStore, .{
-                    .pointer = result_id,
-                    .object = val_id,
-                });
+            const val_id = try cg.constant(ty, val, .indirect);
+            try cg.body.emit(gpa, .OpStore, .{
+                .pointer = result_id,
+                .object = val_id,
+            });
 
-                try cg.body.emit(gpa, .OpReturn, {});
-                try cg.body.emit(gpa, .OpFunctionEnd, {});
-                try cg.module.sections.functions.append(gpa, cg.prologue);
-                try cg.module.sections.functions.append(gpa, cg.body);
+            try cg.body.emit(gpa, .OpReturn, {});
+            try cg.body.emit(gpa, .OpFunctionEnd, {});
+            try cg.module.sections.functions.append(gpa, cg.prologue);
+            try cg.module.sections.functions.append(gpa, cg.body);
 
-                try cg.module.debugNameFmt(initializer_id, "initializer of {f}", .{nav.fqn.fmt(ip)});
+            try cg.module.debugNameFmt(initializer_id, "initializer of {f}", .{nav.fqn.fmt(ip)});
 
-                try cg.module.sections.globals.emit(gpa, .OpExtInst, .{
-                    .id_result_type = ptr_ty_id,
-                    .id_result = result_id,
-                    .set = try cg.module.importInstructionSet(.zig),
-                    .instruction = .{ .inst = @intFromEnum(spec.Zig.InvocationGlobal) },
-                    .id_ref_4 = &.{initializer_id},
-                });
-            } else {
-                try cg.module.sections.globals.emit(gpa, .OpExtInst, .{
-                    .id_result_type = ptr_ty_id,
-                    .id_result = result_id,
-                    .set = try cg.module.importInstructionSet(.zig),
-                    .instruction = .{ .inst = @intFromEnum(spec.Zig.InvocationGlobal) },
-                    .id_ref_4 = &.{},
-                });
-            }
+            try cg.module.sections.globals.emit(gpa, .OpExtInst, .{
+                .id_result_type = ptr_ty_id,
+                .id_result = result_id,
+                .set = try cg.module.importInstructionSet(.zig),
+                .instruction = .{ .inst = @intFromEnum(spec.Zig.InvocationGlobal) },
+                .id_ref_4 = &.{initializer_id},
+            });
         },
     }
 
@@ -404,13 +387,12 @@ fn importExtendedSet(cg: *CodeGen) !Id {
 
 /// Fetch the result-id for a previously generated instruction or constant.
 fn resolve(cg: *CodeGen, inst: Air.Inst.Ref) !Id {
-    const pt = cg.pt;
     const zcu = cg.module.zcu;
     const ip = &zcu.intern_pool;
-    if (try cg.air.value(inst, pt)) |val| {
+    if (inst.toInterned()) |val_ip_index| {
         const ty = cg.typeOf(inst);
         if (ty.zigTypeTag(zcu) == .@"fn") {
-            const fn_nav = switch (zcu.intern_pool.indexToKey(val.ip_index)) {
+            const fn_nav = switch (zcu.intern_pool.indexToKey(val_ip_index)) {
                 .@"extern" => |@"extern"| @"extern".owner_nav,
                 .func => |func| func.owner_nav,
                 else => unreachable,
@@ -420,7 +402,7 @@ fn resolve(cg: *CodeGen, inst: Air.Inst.Ref) !Id {
             return cg.module.declPtr(spv_decl_index).result_id;
         }
 
-        return try cg.constant(ty, val, .direct);
+        return try cg.constant(ty, .fromInterned(val_ip_index), .direct);
     }
     const index = inst.toIndex().?;
     return cg.inst_results.get(index).?; // Assertion means instruction does not dominate usage.
@@ -689,7 +671,7 @@ fn constInt(cg: *CodeGen, ty: Type, value: anytype) !Id {
         .comptime_int => if (value < 0) .signed else .unsigned,
         else => unreachable,
     };
-    if (@sizeOf(@TypeOf(value)) >= 4 and big_int) {
+    if (@TypeOf(value) != comptime_int and @sizeOf(@TypeOf(value)) >= 4 and big_int) {
         const value64: u64 = switch (signedness) {
             .signed => @bitCast(@as(i64, @intCast(value))),
             .unsigned => @as(u64, @intCast(value)),
@@ -810,18 +792,14 @@ fn constant(cg: *CodeGen, ty: Type, val: Value, repr: Repr) Error!Id {
 
             .undef => unreachable, // handled above
 
-            .variable,
             .@"extern",
             .func,
             .enum_literal,
-            .empty_enum_value,
             => unreachable, // non-runtime values
 
             .simple_value => |simple_value| switch (simple_value) {
-                .undefined,
                 .void,
                 .null,
-                .empty_tuple,
                 .@"unreachable",
                 => unreachable, // non-runtime values
 
@@ -887,7 +865,7 @@ fn constant(cg: *CodeGen, ty: Type, val: Value, repr: Repr) Error!Id {
                 return try cg.constructComposite(comp_ty_id, &constituents);
             },
             .enum_tag => {
-                const int_val = try val.intFromEnum(ty, pt);
+                const int_val = val.intFromEnum(zcu);
                 const int_ty = ty.intTagType(zcu);
                 break :cache try cg.constant(int_ty, int_val, repr);
             },
@@ -962,18 +940,7 @@ fn constant(cg: *CodeGen, ty: Type, val: Value, repr: Repr) Error!Id {
                 },
                 .struct_type => {
                     const struct_type = zcu.typeToStruct(ty).?;
-
-                    if (struct_type.layout == .@"packed") {
-                        // TODO: composite int
-                        // TODO: endianness
-                        const bits: u16 = @intCast(ty.bitSize(zcu));
-                        const bytes = std.mem.alignForward(u16, cg.module.backingIntBits(bits).@"0", 8) / 8;
-                        var limbs: [8]u8 = undefined;
-                        @memset(&limbs, 0);
-                        val.writeToPackedMemory(ty, pt, limbs[0..bytes], 0) catch unreachable;
-                        const backing_ty: Type = .fromInterned(struct_type.backingIntTypeUnordered(ip));
-                        return try cg.constInt(backing_ty, @as(u64, @bitCast(limbs)));
-                    }
+                    assert(struct_type.layout != .@"packed"); // packed structs use `bitpack`
 
                     var types = std.array_list.Managed(Type).init(gpa);
                     defer types.deinit();
@@ -984,7 +951,7 @@ fn constant(cg: *CodeGen, ty: Type, val: Value, repr: Repr) Error!Id {
                     var it = struct_type.iterateRuntimeOrder(ip);
                     while (it.next()) |field_index| {
                         const field_ty: Type = .fromInterned(struct_type.field_types.get(ip)[field_index]);
-                        if (!field_ty.hasRuntimeBitsIgnoreComptime(zcu)) {
+                        if (!field_ty.hasRuntimeBits(zcu)) {
                             // This is a zero-bit field - we only needed it for the alignment.
                             continue;
                         }
@@ -1004,20 +971,24 @@ fn constant(cg: *CodeGen, ty: Type, val: Value, repr: Repr) Error!Id {
                 else => unreachable,
             },
             .un => |un| {
+                assert(ty.containerLayout(zcu) != .@"packed"); // packed unions use `bitpack`
                 if (un.tag == .none) {
-                    assert(ty.containerLayout(zcu) == .@"packed"); // TODO
-                    const int_ty = try pt.intType(.unsigned, @intCast(ty.bitSize(zcu)));
-                    return try cg.constInt(int_ty, Value.toUnsignedInt(.fromInterned(un.val), zcu));
+                    @panic("TODO");
                 }
                 const active_field = ty.unionTagFieldIndex(.fromInterned(un.tag), zcu).?;
                 const union_obj = zcu.typeToUnion(ty).?;
                 const field_ty: Type = .fromInterned(union_obj.field_types.get(ip)[active_field]);
-                const payload = if (field_ty.hasRuntimeBitsIgnoreComptime(zcu))
+                const payload = if (field_ty.hasRuntimeBits(zcu))
                     try cg.constant(field_ty, .fromInterned(un.val), .direct)
                 else
                     null;
                 return try cg.unionInit(ty, active_field, payload);
             },
+            .bitpack => |bitpack| {
+                const int_val: Value = .fromInterned(bitpack.backing_int_val);
+                break :cache try cg.constant(int_val.typeOf(zcu), int_val, repr);
+            },
+
             .memoized_call => unreachable,
         }
     };
@@ -1041,7 +1012,7 @@ fn constantPtr(cg: *CodeGen, ptr_val: Value) !Id {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
 
-    const derivation = try ptr_val.pointerDerivation(arena.allocator(), pt);
+    const derivation = try ptr_val.pointerDerivation(arena.allocator(), pt, null);
     return cg.derivePtr(derivation);
 }
 
@@ -1150,7 +1121,7 @@ fn constantUavRef(
     }
 
     // const is_fn_body = decl_ty.zigTypeTag(zcu) == .@"fn";
-    if (!uav_ty.isFnOrHasRuntimeBitsIgnoreComptime(zcu)) {
+    if (!uav_ty.hasRuntimeBits(zcu)) {
         // Pointer to nothing - return undefined
         return cg.module.constUndef(ty_id);
     }
@@ -1180,12 +1151,11 @@ fn constantNavRef(cg: *CodeGen, ty: Type, nav_index: InternPool.Nav.Index) !Id {
     const ip = &zcu.intern_pool;
     const ty_id = try cg.resolveType(ty, .direct);
     const nav = ip.getNav(nav_index);
-    const nav_ty: Type = .fromInterned(nav.typeOf(ip));
+    const nav_ty: Type = .fromInterned(nav.resolved.?.type);
 
-    switch (nav.status) {
-        .unresolved => unreachable,
-        .type_resolved => {}, // this is not a function or extern
-        .fully_resolved => |r| switch (ip.indexToKey(r.val)) {
+    switch (nav.resolved.?.value) {
+        .none => {}, // this is not a function or extern
+        else => |value| switch (ip.indexToKey(value)) {
             .func => {
                 // TODO: Properly lower function pointers. For now we are going to hack around it and
                 // just generate an empty pointer. Function pointers are represented by a pointer to usize.
@@ -1196,7 +1166,7 @@ fn constantNavRef(cg: *CodeGen, ty: Type, nav_index: InternPool.Nav.Index) !Id {
         },
     }
 
-    if (!nav_ty.isFnOrHasRuntimeBitsIgnoreComptime(zcu)) {
+    if (!nav_ty.hasRuntimeBits(zcu)) {
         // Pointer to nothing - return undefined.
         return cg.module.constUndef(ty_id);
     }
@@ -1206,7 +1176,7 @@ fn constantNavRef(cg: *CodeGen, ty: Type, nav_index: InternPool.Nav.Index) !Id {
     const spv_decl_result_id = spv_decl.result_id;
     assert(spv_decl.kind != .func);
 
-    const storage_class = cg.module.storageClass(nav.getAddrspace());
+    const storage_class = cg.module.storageClass(nav.resolved.?.@"addrspace");
     try cg.addFunctionDep(spv_decl_index, storage_class);
 
     const nav_ty_id = try cg.resolveType(nav_ty, .indirect);
@@ -1258,17 +1228,16 @@ fn resolveTypeName(cg: *CodeGen, ty: Type) ![]const u8 {
 fn resolveUnionType(cg: *CodeGen, ty: Type) !Id {
     const gpa = cg.module.gpa;
     const zcu = cg.module.zcu;
-    const ip = &zcu.intern_pool;
     const union_obj = zcu.typeToUnion(ty).?;
 
-    if (union_obj.flagsUnordered(ip).layout == .@"packed") {
+    if (union_obj.layout == .@"packed") {
         return try cg.module.intType(.unsigned, @intCast(ty.bitSize(zcu)));
     }
 
     const layout = cg.unionLayout(ty);
     if (!layout.has_payload) {
         // No payload, so represent this as just the tag type.
-        return try cg.resolveType(.fromInterned(union_obj.enum_tag_ty), .indirect);
+        return try cg.resolveType(.fromInterned(union_obj.enum_tag_type), .indirect);
     }
 
     var member_types: [4]Id = undefined;
@@ -1277,7 +1246,7 @@ fn resolveUnionType(cg: *CodeGen, ty: Type) !Id {
     const u8_ty_id = try cg.resolveType(.u8, .direct);
 
     if (layout.tag_size != 0) {
-        const tag_ty_id = try cg.resolveType(.fromInterned(union_obj.enum_tag_ty), .indirect);
+        const tag_ty_id = try cg.resolveType(.fromInterned(union_obj.enum_tag_type), .indirect);
         member_types[layout.tag_index] = tag_ty_id;
         member_names[layout.tag_index] = "(tag)";
     }
@@ -1318,7 +1287,7 @@ fn resolveUnionType(cg: *CodeGen, ty: Type) !Id {
 
 fn resolveFnReturnType(cg: *CodeGen, ret_ty: Type) !Id {
     const zcu = cg.module.zcu;
-    if (!ret_ty.hasRuntimeBitsIgnoreComptime(zcu)) {
+    if (!ret_ty.hasRuntimeBits(zcu)) {
         // If the return type is an error set or an error union, then we make this
         // anyerror return type instead, so that it can be coerced into a function
         // pointer type which has anyerror as the return type.
@@ -1392,7 +1361,7 @@ fn resolveType(cg: *CodeGen, ty: Type, repr: Repr) Error!Id {
                 return cg.fail("array type of {} elements is too large", .{ty.arrayLenIncludingSentinel(zcu)});
             };
 
-            if (!elem_ty.hasRuntimeBitsIgnoreComptime(zcu)) {
+            if (!elem_ty.hasRuntimeBits(zcu)) {
                 assert(repr == .indirect);
                 if (target.os.tag != .opencl) return cg.fail("cannot generate opaque type", .{});
                 return try cg.module.opaqueType("zero-sized-array");
@@ -1456,7 +1425,7 @@ fn resolveType(cg: *CodeGen, ty: Type, repr: Repr) Error!Id {
                 var param_index: usize = 0;
                 for (fn_info.param_types.get(ip)) |param_ty_index| {
                     const param_ty: Type = .fromInterned(param_ty_index);
-                    if (!param_ty.hasRuntimeBitsIgnoreComptime(zcu)) continue;
+                    if (!param_ty.hasRuntimeBits(zcu)) continue;
 
                     param_ty_ids[param_index] = try cg.resolveType(param_ty, .direct);
                     param_index += 1;
@@ -1521,7 +1490,7 @@ fn resolveType(cg: *CodeGen, ty: Type, repr: Repr) Error!Id {
             };
 
             if (struct_type.layout == .@"packed") {
-                return try cg.resolveType(.fromInterned(struct_type.backingIntTypeUnordered(ip)), .direct);
+                return try cg.resolveType(.fromInterned(struct_type.packed_backing_int_type), .direct);
             }
 
             var member_types = std.array_list.Managed(Id).init(gpa);
@@ -1536,9 +1505,9 @@ fn resolveType(cg: *CodeGen, ty: Type, repr: Repr) Error!Id {
             var it = struct_type.iterateRuntimeOrder(ip);
             while (it.next()) |field_index| {
                 const field_ty: Type = .fromInterned(struct_type.field_types.get(ip)[field_index]);
-                if (!field_ty.hasRuntimeBitsIgnoreComptime(zcu)) continue;
+                if (!field_ty.hasRuntimeBits(zcu)) continue;
 
-                const field_name = struct_type.fieldName(ip, field_index);
+                const field_name = struct_type.field_names.get(ip)[field_index];
                 try member_types.append(try cg.resolveType(field_ty, .indirect));
                 try member_names.append(field_name.toSlice(ip));
                 try member_offsets.append(@intCast(ty.structFieldOffset(field_index, zcu)));
@@ -1559,7 +1528,7 @@ fn resolveType(cg: *CodeGen, ty: Type, repr: Repr) Error!Id {
         },
         .optional => {
             const payload_ty = ty.optionalChild(zcu);
-            if (!payload_ty.hasRuntimeBitsIgnoreComptime(zcu)) {
+            if (!payload_ty.hasRuntimeBits(zcu)) {
                 // Just use a bool.
                 // Note: Always generate the bool with indirect format, to save on some sanity
                 // Perform the conversion to a direct bool when the field is extracted.
@@ -1656,7 +1625,7 @@ fn errorUnionLayout(cg: *CodeGen, payload_ty: Type) ErrorUnionLayout {
 
     const error_first = error_align.compare(.gt, payload_align);
     return .{
-        .payload_has_bits = payload_ty.hasRuntimeBitsIgnoreComptime(zcu),
+        .payload_has_bits = payload_ty.hasRuntimeBits(zcu),
         .error_first = error_first,
     };
 }
@@ -2761,6 +2730,8 @@ fn genInst(cg: *CodeGen, inst: Air.Inst.Index) Error!void {
             .struct_field_val => try cg.airStructFieldVal(inst),
             .field_parent_ptr => try cg.airFieldParentPtr(inst),
 
+            .struct_field_ptr => try cg.airStructFieldPtr(inst),
+
             .struct_field_ptr_index_0 => try cg.airStructFieldPtrIndex(inst, 0),
             .struct_field_ptr_index_1 => try cg.airStructFieldPtrIndex(inst, 1),
             .struct_field_ptr_index_2 => try cg.airStructFieldPtrIndex(inst, 2),
@@ -3725,7 +3696,6 @@ fn cmp(
     const gpa = cg.module.gpa;
     const pt = cg.pt;
     const zcu = cg.module.zcu;
-    const ip = &zcu.intern_pool;
     const scalar_ty = lhs.ty.scalarType(zcu);
     const is_vector = lhs.ty.isVector(zcu);
 
@@ -3738,7 +3708,7 @@ fn cmp(
         },
         .@"struct" => {
             const struct_ty = zcu.typeToPackedStruct(scalar_ty).?;
-            const ty: Type = .fromInterned(struct_ty.backingIntTypeUnordered(ip));
+            const ty: Type = .fromInterned(struct_ty.packed_backing_int_type);
             return try cg.cmp(op, lhs.pun(ty), rhs.pun(ty));
         },
         .error_set => {
@@ -3779,7 +3749,7 @@ fn cmp(
 
             const payload_ty = ty.optionalChild(zcu);
             if (ty.optionalReprIsPayload(zcu)) {
-                assert(payload_ty.hasRuntimeBitsIgnoreComptime(zcu));
+                assert(payload_ty.hasRuntimeBits(zcu));
                 assert(!payload_ty.isSlice(zcu));
 
                 return try cg.cmp(op, lhs.pun(payload_ty), rhs.pun(payload_ty));
@@ -3788,12 +3758,12 @@ fn cmp(
             const lhs_id = try lhs.materialize(cg);
             const rhs_id = try rhs.materialize(cg);
 
-            const lhs_valid_id = if (payload_ty.hasRuntimeBitsIgnoreComptime(zcu))
+            const lhs_valid_id = if (payload_ty.hasRuntimeBits(zcu))
                 try cg.extractField(.bool, lhs_id, 1)
             else
                 try cg.convertToDirect(.bool, lhs_id);
 
-            const rhs_valid_id = if (payload_ty.hasRuntimeBitsIgnoreComptime(zcu))
+            const rhs_valid_id = if (payload_ty.hasRuntimeBits(zcu))
                 try cg.extractField(.bool, rhs_id, 1)
             else
                 try cg.convertToDirect(.bool, rhs_id);
@@ -3801,7 +3771,7 @@ fn cmp(
             const lhs_valid: Temporary = .init(.bool, lhs_valid_id);
             const rhs_valid: Temporary = .init(.bool, rhs_valid_id);
 
-            if (!payload_ty.hasRuntimeBitsIgnoreComptime(zcu)) {
+            if (!payload_ty.hasRuntimeBits(zcu)) {
                 return try cg.cmp(op, lhs_valid, rhs_valid);
             }
 
@@ -4139,7 +4109,7 @@ fn airArrayToSlice(cg: *CodeGen, inst: Air.Inst.Index) !?Id {
     const array_ptr_id = try cg.resolve(ty_op.operand);
     const len_id = try cg.constInt(.usize, array_ty.arrayLen(zcu));
 
-    const elem_ptr_id = if (!array_ty.hasRuntimeBitsIgnoreComptime(zcu))
+    const elem_ptr_id = if (!array_ty.hasRuntimeBits(zcu))
         // Note: The pointer is something like *opaque{}, so we need to bitcast it to the element type.
         try cg.bitCast(elem_ptr_ty, array_ptr_ty, array_ptr_id)
     else
@@ -4175,12 +4145,12 @@ fn airAggregateInit(cg: *CodeGen, inst: Air.Inst.Index) !?Id {
         .@"struct" => {
             if (zcu.typeToPackedStruct(result_ty)) |struct_type| {
                 comptime assert(Type.packed_struct_layout_version == 2);
-                const backing_int_ty: Type = .fromInterned(struct_type.backingIntTypeUnordered(ip));
+                const backing_int_ty: Type = .fromInterned(struct_type.packed_backing_int_type);
                 var running_int_id = try cg.constInt(backing_int_ty, 0);
                 var running_bits: u16 = 0;
                 for (struct_type.field_types.get(ip), elements) |field_ty_ip, element| {
                     const field_ty: Type = .fromInterned(field_ty_ip);
-                    if (!field_ty.hasRuntimeBitsIgnoreComptime(zcu)) continue;
+                    if (!field_ty.hasRuntimeBits(zcu)) continue;
                     const field_id = try cg.resolve(element);
                     const ty_bit_size: u16 = @intCast(field_ty.bitSize(zcu));
                     const field_int_ty = try cg.pt.intType(.unsigned, ty_bit_size);
@@ -4240,7 +4210,7 @@ fn airAggregateInit(cg: *CodeGen, inst: Air.Inst.Index) !?Id {
                         const field_index = it.next().?;
                         if ((try result_ty.structFieldValueComptime(pt, i)) != null) continue;
                         const field_ty: Type = .fromInterned(struct_type.field_types.get(ip)[field_index]);
-                        assert(field_ty.hasRuntimeBitsIgnoreComptime(zcu));
+                        assert(field_ty.hasRuntimeBits(zcu));
 
                         const id = try cg.resolve(element);
                         types[index] = field_ty;
@@ -4379,7 +4349,7 @@ fn airSliceElemVal(cg: *CodeGen, inst: Air.Inst.Index) !?Id {
 fn ptrElemPtr(cg: *CodeGen, ptr_ty: Type, ptr_id: Id, index_id: Id) !Id {
     const zcu = cg.module.zcu;
     // Construct new pointer type for the resulting pointer
-    const elem_ty = ptr_ty.elemType2(zcu); // use elemType() so that we get T for *[N]T.
+    const elem_ty = ptr_ty.indexableElem(zcu);
     const elem_ty_id = try cg.resolveType(elem_ty, .indirect);
     const elem_ptr_ty_id = try cg.module.ptrType(elem_ty_id, cg.module.storageClass(ptr_ty.ptrAddressSpace(zcu)));
     if (ptr_ty.isSinglePointer(zcu)) {
@@ -4400,10 +4370,7 @@ fn airPtrElemPtr(cg: *CodeGen, inst: Air.Inst.Index) !?Id {
     const elem_ty = src_ptr_ty.childType(zcu);
     const ptr_id = try cg.resolve(bin_op.lhs);
 
-    if (!elem_ty.hasRuntimeBitsIgnoreComptime(zcu)) {
-        const dst_ptr_ty = cg.typeOfIndex(inst);
-        return try cg.bitCast(dst_ptr_ty, src_ptr_ty, ptr_id);
-    }
+    assert(elem_ty.hasRuntimeBits(zcu));
 
     const index_id = try cg.resolve(bin_op.rhs);
     return try cg.ptrElemPtr(src_ptr_ty, ptr_id, index_id);
@@ -4481,7 +4448,7 @@ fn airSetUnionTag(cg: *CodeGen, inst: Air.Inst.Index) !void {
 
     if (layout.tag_size == 0) return;
 
-    const tag_ty = un_ty.unionTagTypeSafety(zcu).?;
+    const tag_ty = un_ty.unionTagTypeRuntime(zcu).?;
     const tag_ty_id = try cg.resolveType(tag_ty, .indirect);
     const tag_ptr_ty_id = try cg.module.ptrType(tag_ty_id, cg.module.storageClass(un_ptr_ty.ptrAddressSpace(zcu)));
 
@@ -4507,7 +4474,7 @@ fn airGetUnionTag(cg: *CodeGen, inst: Air.Inst.Index) !?Id {
     const union_handle = try cg.resolve(ty_op.operand);
     if (!layout.has_payload) return union_handle;
 
-    const tag_ty = un_ty.unionTagTypeSafety(zcu).?;
+    const tag_ty = un_ty.unionTagTypeRuntime(zcu).?;
     return try cg.extractField(tag_ty, union_handle, layout.tag_index);
 }
 
@@ -4527,39 +4494,16 @@ fn unionInit(
     const zcu = cg.module.zcu;
     const ip = &zcu.intern_pool;
     const union_ty = zcu.typeToUnion(ty).?;
-    const tag_ty: Type = .fromInterned(union_ty.enum_tag_ty);
+    const tag_ty: Type = .fromInterned(union_ty.enum_tag_type);
 
     const layout = cg.unionLayout(ty);
     const payload_ty: Type = .fromInterned(union_ty.field_types.get(ip)[active_field]);
 
-    if (union_ty.flagsUnordered(ip).layout == .@"packed") {
-        if (!payload_ty.hasRuntimeBitsIgnoreComptime(zcu)) {
-            const int_ty = try pt.intType(.unsigned, @intCast(ty.bitSize(zcu)));
-            return cg.constInt(int_ty, 0);
-        }
-
-        assert(payload != null);
-        if (payload_ty.isInt(zcu)) {
-            if (ty.bitSize(zcu) == payload_ty.bitSize(zcu)) {
-                return cg.bitCast(ty, payload_ty, payload.?);
-            }
-
-            const trunc = try cg.buildConvert(ty, .{ .ty = payload_ty, .value = .{ .singleton = payload.? } });
-            return try trunc.materialize(cg);
-        }
-
-        const payload_int_ty = try pt.intType(.unsigned, @intCast(payload_ty.bitSize(zcu)));
-        const payload_int = if (payload_ty.ip_index == .bool_type)
-            try cg.convertToIndirect(payload_ty, payload.?)
-        else
-            try cg.bitCast(payload_int_ty, payload_ty, payload.?);
-        const trunc = try cg.buildConvert(ty, .{ .ty = payload_int_ty, .value = .{ .singleton = payload_int } });
-        return try trunc.materialize(cg);
-    }
+    assert(union_ty.layout != .@"packed");
 
     const tag_int = if (layout.tag_size != 0) blk: {
         const tag_val = try pt.enumValueFieldIndex(tag_ty, active_field);
-        const tag_int_val = try tag_val.intFromEnum(tag_ty, pt);
+        const tag_int_val = tag_val.intFromEnum(zcu);
         break :blk tag_int_val.toUnsignedInt(zcu);
     } else 0;
 
@@ -4578,7 +4522,7 @@ fn unionInit(
         try cg.store(tag_ty, ptr_id, tag_id, .{});
     }
 
-    if (payload_ty.hasRuntimeBitsIgnoreComptime(zcu)) {
+    if (payload_ty.hasRuntimeBits(zcu)) {
         const layout_payload_ty_id = try cg.resolveType(layout.payload_ty, .indirect);
         const pl_ptr_ty_id = try cg.module.ptrType(layout_payload_ty_id, .function);
         const pl_ptr_id = try cg.accessChain(pl_ptr_ty_id, tmp_id, &.{layout.payload_index});
@@ -4614,7 +4558,7 @@ fn airUnionInit(cg: *CodeGen, inst: Air.Inst.Index) !?Id {
 
     const union_obj = zcu.typeToUnion(ty).?;
     const field_ty: Type = .fromInterned(union_obj.field_types.get(ip)[extra.field_index]);
-    const payload = if (field_ty.hasRuntimeBitsIgnoreComptime(zcu))
+    const payload = if (field_ty.hasRuntimeBits(zcu))
         try cg.resolve(extra.init)
     else
         null;
@@ -4632,7 +4576,7 @@ fn airStructFieldVal(cg: *CodeGen, inst: Air.Inst.Index) !?Id {
     const field_index = struct_field.field_index;
     const field_ty = object_ty.fieldType(field_index, zcu);
 
-    if (!field_ty.hasRuntimeBitsIgnoreComptime(zcu)) return null;
+    assert(field_ty.hasRuntimeBits(zcu));
 
     switch (object_ty.zigTypeTag(zcu)) {
         .@"struct" => switch (object_ty.containerLayout(zcu)) {
@@ -4774,36 +4718,48 @@ fn structFieldPtr(
         },
         .@"struct" => switch (object_ty.containerLayout(zcu)) {
             .@"packed" => return cg.todo("implement field access for packed structs", .{}),
-            else => {
+            .auto, .@"extern" => {
                 return try cg.accessChain(result_ty_id, object_ptr, &.{field_index});
             },
         },
-        .@"union" => {
-            const layout = cg.unionLayout(object_ty);
-            if (!layout.has_payload) {
-                // Asked to get a pointer to a zero-sized field. Just lower this
-                // to undefined, there is no reason to make it be a valid pointer.
-                return try cg.module.constUndef(result_ty_id);
-            }
+        .@"union" => switch (object_ty.containerLayout(zcu)) {
+            .@"packed" => return cg.todo("implement field access for packed unions", .{}),
+            .auto, .@"extern" => {
+                const layout = cg.unionLayout(object_ty);
+                if (!layout.has_payload) {
+                    // Asked to get a pointer to a zero-sized field. Just lower this
+                    // to undefined, there is no reason to make it be a valid pointer.
+                    return try cg.module.constUndef(result_ty_id);
+                }
 
-            const storage_class = cg.module.storageClass(object_ptr_ty.ptrAddressSpace(zcu));
-            const layout_payload_ty_id = try cg.resolveType(layout.payload_ty, .indirect);
-            const pl_ptr_ty_id = try cg.module.ptrType(layout_payload_ty_id, storage_class);
-            const pl_ptr_id = blk: {
-                if (object_ty.containerLayout(zcu) == .@"packed") break :blk object_ptr;
-                break :blk try cg.accessChain(pl_ptr_ty_id, object_ptr, &.{layout.payload_index});
-            };
+                const storage_class = cg.module.storageClass(object_ptr_ty.ptrAddressSpace(zcu));
+                const layout_payload_ty_id = try cg.resolveType(layout.payload_ty, .indirect);
+                const pl_ptr_ty_id = try cg.module.ptrType(layout_payload_ty_id, storage_class);
+                const pl_ptr_id = blk: {
+                    if (object_ty.containerLayout(zcu) == .@"packed") break :blk object_ptr;
+                    break :blk try cg.accessChain(pl_ptr_ty_id, object_ptr, &.{layout.payload_index});
+                };
 
-            const active_pl_ptr_id = cg.module.allocId();
-            try cg.body.emit(cg.module.gpa, .OpBitcast, .{
-                .id_result_type = result_ty_id,
-                .id_result = active_pl_ptr_id,
-                .operand = pl_ptr_id,
-            });
-            return active_pl_ptr_id;
+                const active_pl_ptr_id = cg.module.allocId();
+                try cg.body.emit(cg.module.gpa, .OpBitcast, .{
+                    .id_result_type = result_ty_id,
+                    .id_result = active_pl_ptr_id,
+                    .operand = pl_ptr_id,
+                });
+                return active_pl_ptr_id;
+            },
         },
         else => unreachable,
     }
+}
+
+fn airStructFieldPtr(cg: *CodeGen, inst: Air.Inst.Index) !?Id {
+    const ty_pl = cg.air.instructions.items(.data)[@intFromEnum(inst)].ty_pl;
+    const struct_field = cg.air.extraData(Air.StructField, ty_pl.payload).data;
+    const struct_ptr = try cg.resolve(struct_field.struct_operand);
+    const struct_ptr_ty = cg.typeOf(struct_field.struct_operand);
+    const result_ptr_ty = cg.typeOfIndex(inst);
+    return try cg.structFieldPtr(result_ptr_ty, struct_ptr_ty, struct_ptr, struct_field.field_index);
 }
 
 fn airStructFieldPtrIndex(cg: *CodeGen, inst: Air.Inst.Index, field_index: u32) !?Id {
@@ -5002,9 +4958,8 @@ fn genStructuredBody(
 }
 
 fn airBlock(cg: *CodeGen, inst: Air.Inst.Index) !?Id {
-    const inst_datas = cg.air.instructions.items(.data);
-    const extra = cg.air.extraData(Air.Block, inst_datas[@intFromEnum(inst)].ty_pl.payload);
-    return cg.lowerBlock(inst, @ptrCast(cg.air.extra.items[extra.end..][0..extra.data.body_len]));
+    const block = cg.air.unwrapBlock(inst);
+    return cg.lowerBlock(inst, block.body);
 }
 
 fn lowerBlock(cg: *CodeGen, inst: Air.Inst.Index, body: []const Air.Inst.Index) !?Id {
@@ -5018,7 +4973,7 @@ fn lowerBlock(cg: *CodeGen, inst: Air.Inst.Index, body: []const Air.Inst.Index) 
     const gpa = cg.module.gpa;
     const zcu = cg.module.zcu;
     const ty = cg.typeOfIndex(inst);
-    const have_block_result = ty.isFnOrHasRuntimeBitsIgnoreComptime(zcu);
+    const have_block_result = ty.hasRuntimeBits(zcu);
 
     const cf = switch (cg.control_flow) {
         .structured => |*cf| cf,
@@ -5156,7 +5111,7 @@ fn airBr(cg: *CodeGen, inst: Air.Inst.Index) !void {
 
     switch (cg.control_flow) {
         .structured => |*cf| {
-            if (operand_ty.isFnOrHasRuntimeBitsIgnoreComptime(zcu)) {
+            if (operand_ty.hasRuntimeBits(zcu)) {
                 const operand_id = try cg.resolve(br.operand);
                 const block_result_var_id = cf.block_results.get(br.block_inst).?;
                 try cg.store(operand_ty, block_result_var_id, operand_id, .{});
@@ -5167,7 +5122,7 @@ fn airBr(cg: *CodeGen, inst: Air.Inst.Index) !void {
         },
         .unstructured => |cf| {
             const block = cf.blocks.get(br.block_inst).?;
-            if (operand_ty.isFnOrHasRuntimeBitsIgnoreComptime(zcu)) {
+            if (operand_ty.hasRuntimeBits(zcu)) {
                 const operand_id = try cg.resolve(br.operand);
                 // block_label should not be undefined here, lest there
                 // is a br or br_void in the function's body.
@@ -5188,11 +5143,10 @@ fn airBr(cg: *CodeGen, inst: Air.Inst.Index) !void {
 
 fn airCondBr(cg: *CodeGen, inst: Air.Inst.Index) !void {
     const gpa = cg.module.gpa;
-    const pl_op = cg.air.instructions.items(.data)[@intFromEnum(inst)].pl_op;
-    const cond_br = cg.air.extraData(Air.CondBr, pl_op.payload);
-    const then_body: []const Air.Inst.Index = @ptrCast(cg.air.extra.items[cond_br.end..][0..cond_br.data.then_body_len]);
-    const else_body: []const Air.Inst.Index = @ptrCast(cg.air.extra.items[cond_br.end + then_body.len ..][0..cond_br.data.else_body_len]);
-    const condition_id = try cg.resolve(pl_op.operand);
+    const cond_br = cg.air.unwrapCondBr(inst);
+    const then_body = cond_br.then_body;
+    const else_body = cond_br.else_body;
+    const condition_id = try cg.resolve(cond_br.condition);
 
     const then_label = cg.module.allocId();
     const else_label = cg.module.allocId();
@@ -5251,9 +5205,7 @@ fn airCondBr(cg: *CodeGen, inst: Air.Inst.Index) !void {
 
 fn airLoop(cg: *CodeGen, inst: Air.Inst.Index) !void {
     const gpa = cg.module.gpa;
-    const ty_pl = cg.air.instructions.items(.data)[@intFromEnum(inst)].ty_pl;
-    const loop = cg.air.extraData(Air.Block, ty_pl.payload);
-    const body: []const Air.Inst.Index = @ptrCast(cg.air.extra.items[loop.end..][0..loop.data.body_len]);
+    const block = cg.air.unwrapBlock(inst);
 
     const body_label = cg.module.allocId();
 
@@ -5284,7 +5236,7 @@ fn airLoop(cg: *CodeGen, inst: Air.Inst.Index) !void {
             const next_block = try cg.genStructuredBody(.{ .loop = .{
                 .merge_label = merge_label,
                 .continue_label = continue_label,
-            } }, body);
+            } }, block.body);
             try cg.structuredBreak(next_block);
 
             try cg.beginSpvBlock(continue_label);
@@ -5294,7 +5246,7 @@ fn airLoop(cg: *CodeGen, inst: Air.Inst.Index) !void {
         .unstructured => {
             try cg.body.emit(gpa, .OpBranch, .{ .target_label = body_label });
             try cg.beginSpvBlock(body_label);
-            try cg.genBody(body);
+            try cg.genBody(block.body);
 
             try cg.body.emit(gpa, .OpBranch, .{ .target_label = body_label });
         },
@@ -5328,7 +5280,7 @@ fn airRet(cg: *CodeGen, inst: Air.Inst.Index) !void {
     const zcu = cg.module.zcu;
     const operand = cg.air.instructions.items(.data)[@intFromEnum(inst)].un_op;
     const ret_ty = cg.typeOf(operand);
-    if (!ret_ty.hasRuntimeBitsIgnoreComptime(zcu)) {
+    if (!ret_ty.hasRuntimeBits(zcu)) {
         const fn_info = zcu.typeToFunc(zcu.navValue(cg.owner_nav).typeOf(zcu)).?;
         if (Type.fromInterned(fn_info.return_type).isError(zcu)) {
             // Functions with an empty error set are emitted with an error code
@@ -5352,7 +5304,7 @@ fn airRetLoad(cg: *CodeGen, inst: Air.Inst.Index) !void {
     const ptr_ty = cg.typeOf(un_op);
     const ret_ty = ptr_ty.childType(zcu);
 
-    if (!ret_ty.hasRuntimeBitsIgnoreComptime(zcu)) {
+    if (!ret_ty.hasRuntimeBits(zcu)) {
         const fn_info = zcu.typeToFunc(zcu.navValue(cg.owner_nav).typeOf(zcu)).?;
         if (Type.fromInterned(fn_info.return_type).isError(zcu)) {
             // Functions with an empty error set are emitted with an error code
@@ -5375,12 +5327,11 @@ fn airRetLoad(cg: *CodeGen, inst: Air.Inst.Index) !void {
 fn airTry(cg: *CodeGen, inst: Air.Inst.Index) !?Id {
     const gpa = cg.module.gpa;
     const zcu = cg.module.zcu;
-    const pl_op = cg.air.instructions.items(.data)[@intFromEnum(inst)].pl_op;
-    const err_union_id = try cg.resolve(pl_op.operand);
-    const extra = cg.air.extraData(Air.Try, pl_op.payload);
-    const body: []const Air.Inst.Index = @ptrCast(cg.air.extra.items[extra.end..][0..extra.data.body_len]);
+    const unwrapped_try = cg.air.unwrapTry(inst);
+    const body = unwrapped_try.else_body;
 
-    const err_union_ty = cg.typeOf(pl_op.operand);
+    const err_union_id = try cg.resolve(unwrapped_try.error_union);
+    const err_union_ty = cg.air.typeOf(unwrapped_try.error_union, &zcu.intern_pool);
     const payload_ty = cg.typeOfIndex(inst);
 
     const bool_ty_id = try cg.resolveType(.bool, .direct);
@@ -5570,7 +5521,7 @@ fn airIsNull(cg: *CodeGen, inst: Air.Inst.Index, is_pointer: bool, pred: enum { 
 
     const is_non_null_id = blk: {
         if (is_pointer) {
-            if (payload_ty.hasRuntimeBitsIgnoreComptime(zcu)) {
+            if (payload_ty.hasRuntimeBits(zcu)) {
                 const storage_class = cg.module.storageClass(operand_ty.ptrAddressSpace(zcu));
                 const bool_indirect_ty_id = try cg.resolveType(.bool, .indirect);
                 const bool_ptr_ty_id = try cg.module.ptrType(bool_indirect_ty_id, storage_class);
@@ -5581,7 +5532,7 @@ fn airIsNull(cg: *CodeGen, inst: Air.Inst.Index, is_pointer: bool, pred: enum { 
             break :blk try cg.load(.bool, operand_id, .{});
         }
 
-        break :blk if (payload_ty.hasRuntimeBitsIgnoreComptime(zcu))
+        break :blk if (payload_ty.hasRuntimeBits(zcu))
             try cg.extractField(.bool, operand_id, 1)
         else
             // Optional representation is bool indicating whether the optional is set
@@ -5650,7 +5601,7 @@ fn airUnwrapOptional(cg: *CodeGen, inst: Air.Inst.Index) !?Id {
     const optional_ty = cg.typeOf(ty_op.operand);
     const payload_ty = cg.typeOfIndex(inst);
 
-    if (!payload_ty.hasRuntimeBitsIgnoreComptime(zcu)) return null;
+    if (!payload_ty.hasRuntimeBits(zcu)) return null;
 
     if (optional_ty.optionalReprIsPayload(zcu)) {
         return operand_id;
@@ -5669,7 +5620,7 @@ fn airUnwrapOptionalPtr(cg: *CodeGen, inst: Air.Inst.Index) !?Id {
     const result_ty = cg.typeOfIndex(inst);
     const result_ty_id = try cg.resolveType(result_ty, .direct);
 
-    if (!payload_ty.hasRuntimeBitsIgnoreComptime(zcu)) {
+    if (!payload_ty.hasRuntimeBits(zcu)) {
         // There is no payload, but we still need to return a valid pointer.
         // We can just return anything here, so just return a pointer to the operand.
         return try cg.bitCast(result_ty, operand_ty, operand_id);
@@ -5688,9 +5639,7 @@ fn airWrapOptional(cg: *CodeGen, inst: Air.Inst.Index) !?Id {
     const ty_op = cg.air.instructions.items(.data)[@intFromEnum(inst)].ty_op;
     const payload_ty = cg.typeOf(ty_op.operand);
 
-    if (!payload_ty.hasRuntimeBitsIgnoreComptime(zcu)) {
-        return try cg.constBool(true, .indirect);
-    }
+    assert(payload_ty.hasRuntimeBits(zcu));
 
     const operand_id = try cg.resolve(ty_op.operand);
 
@@ -5707,7 +5656,6 @@ fn airWrapOptional(cg: *CodeGen, inst: Air.Inst.Index) !?Id {
 
 fn airSwitchBr(cg: *CodeGen, inst: Air.Inst.Index) !void {
     const gpa = cg.module.gpa;
-    const pt = cg.pt;
     const zcu = cg.module.zcu;
     const target = cg.module.zcu.getTarget();
     const switch_br = cg.air.unwrapSwitch(inst);
@@ -5782,12 +5730,11 @@ fn airSwitchBr(cg: *CodeGen, inst: Air.Inst.Index) !void {
             const label = case_labels.at(case.idx);
 
             for (case.items) |item| {
-                const value = (try cg.air.value(item, pt)) orelse unreachable;
+                const value: Value = .fromInterned(item.toInterned().?);
                 const int_val: u64 = switch (cond_ty.zigTypeTag(zcu)) {
                     .bool, .int => if (cond_ty.isSignedInt(zcu)) @bitCast(value.toSignedInt(zcu)) else value.toUnsignedInt(zcu),
                     .@"enum" => blk: {
-                        // TODO: figure out of cond_ty is correct (something with enum literals)
-                        break :blk (try value.intFromEnum(cond_ty, pt)).toUnsignedInt(zcu); // TODO: composite integer constants
+                        break :blk value.intFromEnum(zcu).toUnsignedInt(zcu); // TODO: composite integer constants
                     },
                     .error_set => value.getErrorInt(zcu),
                     .pointer => value.toUnsignedInt(zcu),
@@ -5882,12 +5829,11 @@ fn airDbgStmt(cg: *CodeGen, inst: Air.Inst.Index) !void {
 
 fn airDbgInlineBlock(cg: *CodeGen, inst: Air.Inst.Index) !?Id {
     const zcu = cg.module.zcu;
-    const inst_datas = cg.air.instructions.items(.data);
-    const extra = cg.air.extraData(Air.DbgInlineBlock, inst_datas[@intFromEnum(inst)].ty_pl.payload);
+    const block = cg.air.unwrapDbgBlock(inst);
     const old_base_line = cg.base_line;
     defer cg.base_line = old_base_line;
-    cg.base_line = zcu.navSrcLine(zcu.funcInfo(extra.data.func).owner_nav);
-    return cg.lowerBlock(inst, @ptrCast(cg.air.extra.items[extra.end..][0..extra.data.body_len]));
+    cg.base_line = zcu.navSrcLine(zcu.funcInfo(block.func).owner_nav);
+    return cg.lowerBlock(inst, block.body);
 }
 
 fn airDbgVar(cg: *CodeGen, inst: Air.Inst.Index) !void {
@@ -5900,54 +5846,36 @@ fn airDbgVar(cg: *CodeGen, inst: Air.Inst.Index) !void {
 fn airAssembly(cg: *CodeGen, inst: Air.Inst.Index) !?Id {
     const gpa = cg.module.gpa;
     const zcu = cg.module.zcu;
-    const ty_pl = cg.air.instructions.items(.data)[@intFromEnum(inst)].ty_pl;
-    const extra = cg.air.extraData(Air.Asm, ty_pl.payload);
+    const unwrapped_asm = cg.air.unwrapAsm(inst);
 
-    const is_volatile = extra.data.flags.is_volatile;
-    const outputs_len = extra.data.flags.outputs_len;
+    const is_volatile = unwrapped_asm.is_volatile;
+    const outputs_len = unwrapped_asm.outputs.len;
 
     if (!is_volatile and cg.liveness.isUnused(inst)) return null;
 
-    var extra_i: usize = extra.end;
-    const outputs: []const Air.Inst.Ref = @ptrCast(cg.air.extra.items[extra_i..][0..outputs_len]);
-    extra_i += outputs.len;
-    const inputs: []const Air.Inst.Ref = @ptrCast(cg.air.extra.items[extra_i..][0..extra.data.inputs_len]);
-    extra_i += inputs.len;
-
-    if (outputs.len > 1) {
+    if (outputs_len > 1) {
         return cg.todo("implement inline asm with more than 1 output", .{});
     }
 
     var ass: Assembler = .{ .cg = cg };
     defer ass.deinit();
 
-    var output_extra_i = extra_i;
-    for (outputs) |output| {
-        if (output != .none) {
+    var it = unwrapped_asm.iterateOutputs();
+    while (it.next()) |out| {
+        if (out.operand != .none) {
             return cg.todo("implement inline asm with non-returned output", .{});
         }
-        const extra_bytes = std.mem.sliceAsBytes(cg.air.extra.items[extra_i..]);
-        const constraint = std.mem.sliceTo(std.mem.sliceAsBytes(cg.air.extra.items[extra_i..]), 0);
-        const name = std.mem.sliceTo(extra_bytes[constraint.len + 1 ..], 0);
-        extra_i += (constraint.len + name.len + (2 + 3)) / 4;
-        // TODO: Record output and use it somewhere.
     }
 
-    for (inputs) |input| {
-        const extra_bytes = std.mem.sliceAsBytes(cg.air.extra.items[extra_i..]);
-        const constraint = std.mem.sliceTo(extra_bytes, 0);
-        const name = std.mem.sliceTo(extra_bytes[constraint.len + 1 ..], 0);
-        // This equation accounts for the fact that even if we have exactly 4 bytes
-        // for the string, we still use the next u32 for the null terminator.
-        extra_i += (constraint.len + name.len + (2 + 3)) / 4;
+    it = unwrapped_asm.iterateInputs();
+    while (it.next()) |in| {
+        const input_ty = cg.typeOf(in.operand);
 
-        const input_ty = cg.typeOf(input);
-
-        if (std.mem.eql(u8, constraint, "c")) {
+        if (std.mem.eql(u8, in.constraint, "c")) {
             // constant
-            const val = (try cg.air.value(input, cg.pt)) orelse {
+            const val: Value = .fromInterned(in.operand.toInterned() orelse {
                 return cg.fail("assembly inputs with 'c' constraint have to be compile-time known", .{});
-            };
+            });
 
             // TODO: This entire function should be handled a bit better...
             const ip = &zcu.intern_pool;
@@ -5971,37 +5899,35 @@ fn airAssembly(cg: *CodeGen, inst: Air.Inst.Index) !?Id {
 
                 .undef => return cg.fail("assembly input with 'c' constraint cannot be undefined", .{}),
 
-                .int => try ass.value_map.put(gpa, name, .{ .constant = @intCast(val.toUnsignedInt(zcu)) }),
-                .enum_literal => |str| try ass.value_map.put(gpa, name, .{ .string = str.toSlice(ip) }),
+                .int => try ass.value_map.put(gpa, in.name, .{ .constant = @intCast(val.toUnsignedInt(zcu)) }),
+                .enum_literal => |str| try ass.value_map.put(gpa, in.name, .{ .string = str.toSlice(ip) }),
 
                 else => unreachable, // TODO
             }
-        } else if (std.mem.eql(u8, constraint, "t")) {
+        } else if (std.mem.eql(u8, in.constraint, "t")) {
             // type
             if (input_ty.zigTypeTag(zcu) == .type) {
                 // This assembly input is a type instead of a value.
                 // That's fine for now, just make sure to resolve it as such.
-                const val = (try cg.air.value(input, cg.pt)).?;
-                const ty_id = try cg.resolveType(val.toType(), .direct);
-                try ass.value_map.put(gpa, name, .{ .ty = ty_id });
+                const ty_id = try cg.resolveType(in.operand.toType(), .direct);
+                try ass.value_map.put(gpa, in.name, .{ .ty = ty_id });
             } else {
                 const ty_id = try cg.resolveType(input_ty, .direct);
-                try ass.value_map.put(gpa, name, .{ .ty = ty_id });
+                try ass.value_map.put(gpa, in.name, .{ .ty = ty_id });
             }
         } else {
             if (input_ty.zigTypeTag(zcu) == .type) {
                 return cg.fail("use the 't' constraint to supply types to SPIR-V inline assembly", .{});
             }
 
-            const val_id = try cg.resolve(input);
-            try ass.value_map.put(gpa, name, .{ .value = val_id });
+            const val_id = try cg.resolve(in.operand);
+            try ass.value_map.put(gpa, in.name, .{ .value = val_id });
         }
     }
-
     // TODO: do something with clobbers
-    _ = extra.data.clobbers;
+    _ = unwrapped_asm.clobbers;
 
-    const asm_source = std.mem.sliceAsBytes(cg.air.extra.items[extra_i..])[0..extra.data.source_len];
+    const asm_source = unwrapped_asm.source;
 
     ass.assemble(asm_source) catch |err| switch (err) {
         error.AssembleFail => {
@@ -6033,26 +5959,20 @@ fn airAssembly(cg: *CodeGen, inst: Air.Inst.Index) !?Id {
         else => |others| return others,
     };
 
-    for (outputs) |output| {
-        _ = output;
-        const extra_bytes = std.mem.sliceAsBytes(cg.air.extra.items[output_extra_i..]);
-        const constraint = std.mem.sliceTo(std.mem.sliceAsBytes(cg.air.extra.items[output_extra_i..]), 0);
-        const name = std.mem.sliceTo(extra_bytes[constraint.len + 1 ..], 0);
-        output_extra_i += (constraint.len + name.len + (2 + 3)) / 4;
-
-        const result = ass.value_map.get(name) orelse return {
-            return cg.fail("invalid asm output '{s}'", .{name});
+    it = unwrapped_asm.iterateOutputs();
+    while (it.next()) |out| {
+        const result = ass.value_map.get(out.name) orelse return {
+            return cg.fail("invalid asm output '{s}'", .{out.name});
         };
-
         switch (result) {
             .just_declared, .unresolved_forward_reference => unreachable,
             .ty => return cg.fail("cannot return spir-v type as value from assembly", .{}),
             .value => |ref| return ref,
             .constant, .string => return cg.fail("cannot return constant from assembly", .{}),
         }
-
         // TODO: Multiple results
         // TODO: Check that the output type from assembly is the same as the type actually expected by Zig.
+
     }
 
     return null;
@@ -6063,10 +5983,9 @@ fn airCall(cg: *CodeGen, inst: Air.Inst.Index, modifier: std.builtin.CallModifie
 
     const gpa = cg.module.gpa;
     const zcu = cg.module.zcu;
-    const pl_op = cg.air.instructions.items(.data)[@intFromEnum(inst)].pl_op;
-    const extra = cg.air.extraData(Air.Call, pl_op.payload);
-    const args: []const Air.Inst.Ref = @ptrCast(cg.air.extra.items[extra.end..][0..extra.data.args_len]);
-    const callee_ty = cg.typeOf(pl_op.operand);
+    const air_call = cg.air.unwrapCall(inst);
+    const args = air_call.args;
+    const callee_ty = cg.typeOf(air_call.callee);
     const zig_fn_ty = switch (callee_ty.zigTypeTag(zcu)) {
         .@"fn" => callee_ty,
         .pointer => return cg.fail("cannot call function pointers", .{}),
@@ -6077,7 +5996,7 @@ fn airCall(cg: *CodeGen, inst: Air.Inst.Index, modifier: std.builtin.CallModifie
 
     const result_type_id = try cg.resolveFnReturnType(.fromInterned(return_type));
     const result_id = cg.module.allocId();
-    const callee_id = try cg.resolve(pl_op.operand);
+    const callee_id = try cg.resolve(air_call.callee);
 
     comptime assert(zig_call_abi_ver == 3);
 
@@ -6091,7 +6010,7 @@ fn airCall(cg: *CodeGen, inst: Air.Inst.Index, modifier: std.builtin.CallModifie
         // before starting to emit OpFunctionCall instructions. Hence the
         // temporary params buffer.
         const arg_ty = cg.typeOf(arg);
-        if (!arg_ty.hasRuntimeBitsIgnoreComptime(zcu)) continue;
+        if (!arg_ty.hasRuntimeBits(zcu)) continue;
         const arg_id = try cg.resolve(arg);
 
         params[n_params] = arg_id;
@@ -6105,7 +6024,7 @@ fn airCall(cg: *CodeGen, inst: Air.Inst.Index, modifier: std.builtin.CallModifie
         .id_ref_3 = params[0..n_params],
     });
 
-    if (cg.liveness.isUnused(inst) or !Type.fromInterned(return_type).hasRuntimeBitsIgnoreComptime(zcu)) {
+    if (cg.liveness.isUnused(inst) or !Type.fromInterned(return_type).hasRuntimeBits(zcu)) {
         return null;
     }
 

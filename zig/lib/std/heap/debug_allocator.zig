@@ -81,7 +81,7 @@
 //! Resizing and remapping are forwarded directly to the backing allocator,
 //! except where such operations would change the category from large to small.
 const builtin = @import("builtin");
-const StackTrace = std.builtin.StackTrace;
+const StackTrace = std.debug.StackTrace;
 
 const std = @import("std");
 const log = std.log.scoped(.DebugAllocator);
@@ -125,16 +125,6 @@ pub const Config = struct {
 
     /// Whether the allocator may be used simultaneously from multiple threads.
     thread_safe: bool = !builtin.single_threaded,
-
-    /// What type of mutex you'd like to use, for thread safety.
-    /// when specified, the mutex type must have the same shape as `std.Thread.Mutex` and
-    /// `DummyMutex`, and have no required fields. Specifying this field causes
-    /// the `thread_safe` field to be ignored.
-    ///
-    /// when null (default):
-    /// * the mutex type defaults to `std.Thread.Mutex` when thread_safe is enabled.
-    /// * the mutex type defaults to `DummyMutex` otherwise.
-    MutexType: ?type = null,
 
     /// This is a temporary debugging trick you can use to turn segfaults into more helpful
     /// logged error messages with stack trace details. The downside is that every allocation
@@ -204,17 +194,8 @@ pub fn DebugAllocator(comptime config: Config) type {
         const total_requested_bytes_init = if (config.enable_memory_limit) @as(usize, 0) else {};
         const requested_memory_limit_init = if (config.enable_memory_limit) @as(usize, math.maxInt(usize)) else {};
 
-        const mutex_init = if (config.MutexType) |T|
-            T{}
-        else if (config.thread_safe)
-            std.Thread.Mutex{}
-        else
-            DummyMutex{};
-
-        const DummyMutex = struct {
-            inline fn lock(_: DummyMutex) void {}
-            inline fn unlock(_: DummyMutex) void {}
-        };
+        const have_mutex = config.thread_safe;
+        const mutex_init = if (have_mutex) std.Io.Mutex.init else {};
 
         const stack_n = config.stack_trace_frames;
         const one_trace_size = @sizeOf(usize) * stack_n;
@@ -248,7 +229,7 @@ pub fn DebugAllocator(comptime config: Config) type {
                 std.debug.dumpStackTrace(self.getStackTrace(trace_kind));
             }
 
-            fn getStackTrace(self: *LargeAlloc, trace_kind: TraceKind) std.builtin.StackTrace {
+            fn getStackTrace(self: *LargeAlloc, trace_kind: TraceKind) std.debug.StackTrace {
                 assert(@intFromEnum(trace_kind) < trace_n);
                 const stack_addresses = &self.stack_addresses[@intFromEnum(trace_kind)];
                 var len: usize = 0;
@@ -256,8 +237,8 @@ pub fn DebugAllocator(comptime config: Config) type {
                     len += 1;
                 }
                 return .{
-                    .instruction_addresses = stack_addresses,
-                    .index = len,
+                    .return_addresses = stack_addresses[0..len],
+                    .skipped = if (len < stack_addresses.len) .none else .unknown,
                 };
             }
 
@@ -285,7 +266,7 @@ pub fn DebugAllocator(comptime config: Config) type {
             canary: usize = config.canary,
 
             fn fromPage(page_addr: usize, slot_count: usize) *BucketHeader {
-                const unaligned = page_addr + page_size - bucketSize(slot_count);
+                const unaligned = page_addr +% page_size -% bucketSize(slot_count);
                 return @ptrFromInt(unaligned & ~(@as(usize, @alignOf(BucketHeader)) - 1));
             }
 
@@ -358,8 +339,8 @@ pub fn DebugAllocator(comptime config: Config) type {
                 len += 1;
             }
             return .{
-                .instruction_addresses = stack_addresses,
-                .index = len,
+                .return_addresses = stack_addresses[0..len],
+                .skipped = if (len < stack_addresses.len) .none else .unknown,
             };
         }
 
@@ -527,7 +508,7 @@ pub fn DebugAllocator(comptime config: Config) type {
 
         fn collectStackTrace(first_trace_addr: usize, addr_buf: *[stack_n]usize) void {
             const st = std.debug.captureCurrentStackTrace(.{ .first_address = first_trace_addr }, addr_buf);
-            @memset(addr_buf[@min(st.index, addr_buf.len)..], 0);
+            @memset(addr_buf[@min(st.return_addresses.len, addr_buf.len)..], 0);
         }
 
         fn reportDoubleFree(ret_addr: usize, alloc_stack_trace: StackTrace, free_stack_trace: StackTrace) void {
@@ -737,8 +718,8 @@ pub fn DebugAllocator(comptime config: Config) type {
 
         fn alloc(context: *anyopaque, len: usize, alignment: mem.Alignment, ret_addr: usize) ?[*]u8 {
             const self: *Self = @ptrCast(@alignCast(context));
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            if (have_mutex) std.Io.Threaded.mutexLock(&self.mutex);
+            defer if (have_mutex) std.Io.Threaded.mutexUnlock(&self.mutex);
 
             if (config.enable_memory_limit) {
                 const new_req_bytes = self.total_requested_bytes + len;
@@ -850,8 +831,8 @@ pub fn DebugAllocator(comptime config: Config) type {
             return_address: usize,
         ) bool {
             const self: *Self = @ptrCast(@alignCast(context));
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            if (have_mutex) std.Io.Threaded.mutexLock(&self.mutex);
+            defer if (have_mutex) std.Io.Threaded.mutexUnlock(&self.mutex);
 
             const size_class_index: usize = @max(@bitSizeOf(usize) - @clz(memory.len - 1), @intFromEnum(alignment));
             if (size_class_index >= self.buckets.len) {
@@ -869,8 +850,8 @@ pub fn DebugAllocator(comptime config: Config) type {
             return_address: usize,
         ) ?[*]u8 {
             const self: *Self = @ptrCast(@alignCast(context));
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            if (have_mutex) std.Io.Threaded.mutexLock(&self.mutex);
+            defer if (have_mutex) std.Io.Threaded.mutexUnlock(&self.mutex);
 
             const size_class_index: usize = @max(@bitSizeOf(usize) - @clz(memory.len - 1), @intFromEnum(alignment));
             if (size_class_index >= self.buckets.len) {
@@ -887,8 +868,8 @@ pub fn DebugAllocator(comptime config: Config) type {
             return_address: usize,
         ) void {
             const self: *Self = @ptrCast(@alignCast(context));
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            if (have_mutex) std.Io.Threaded.mutexLock(&self.mutex);
+            defer if (have_mutex) std.Io.Threaded.mutexUnlock(&self.mutex);
 
             const size_class_index: usize = @max(@bitSizeOf(usize) - @clz(old_memory.len - 1), @intFromEnum(alignment));
             if (size_class_index >= self.buckets.len) {
@@ -1010,7 +991,14 @@ pub fn DebugAllocator(comptime config: Config) type {
             size_class_index: usize,
         ) bool {
             const new_size_class_index: usize = @max(@bitSizeOf(usize) - @clz(new_len - 1), @intFromEnum(alignment));
-            if (!config.safety) return new_size_class_index == size_class_index;
+            if (!config.safety) {
+                if (new_size_class_index != size_class_index) return false;
+                // Still account for total even if safety is off
+                if (config.enable_memory_limit)
+                    self.total_requested_bytes = self.total_requested_bytes - memory.len + new_len;
+                return true;
+            }
+
             const slot_count = slot_counts[size_class_index];
             const memory_addr = @intFromPtr(memory.ptr);
             const page_addr = memory_addr & ~(page_size - 1);
@@ -1322,18 +1310,6 @@ test "realloc large object to small object" {
     slice = try allocator.realloc(slice, 19);
     try std.testing.expect(slice[0] == 0x12);
     try std.testing.expect(slice[16] == 0x34);
-}
-
-test "overridable mutexes" {
-    var gpa = DebugAllocator(.{ .MutexType = std.Thread.Mutex }){
-        .backing_allocator = std.testing.allocator,
-        .mutex = std.Thread.Mutex{},
-    };
-    defer std.testing.expect(gpa.deinit() == .ok) catch @panic("leak");
-    const allocator = gpa.allocator();
-
-    const ptr = try allocator.create(i32);
-    defer allocator.destroy(ptr);
 }
 
 test "non-page-allocator backing allocator" {

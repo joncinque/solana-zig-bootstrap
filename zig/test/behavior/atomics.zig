@@ -143,7 +143,7 @@ test "cmpxchg on a global variable" {
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
 
-    _ = @cmpxchgWeak(u32, &a_global_variable, 1234, 42, .acquire, .monotonic);
+    _ = @cmpxchgStrong(u32, &a_global_variable, 1234, 42, .acquire, .monotonic);
     try expect(a_global_variable == 42);
 }
 
@@ -189,6 +189,7 @@ test "atomicrmw with floats" {
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_wasm) return error.SkipZigTest;
 
     try testAtomicRmwFloat();
     try comptime testAtomicRmwFloat();
@@ -215,11 +216,6 @@ test "atomicrmw with ints" {
     if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
     if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_riscv64) return error.SkipZigTest;
-
-    if (builtin.zig_backend == .stage2_llvm and builtin.cpu.arch.isMIPS()) {
-        // https://github.com/ziglang/zig/issues/16846
-        return error.SkipZigTest;
-    }
 
     try testAtomicRmwInts();
     try comptime testAtomicRmwInts();

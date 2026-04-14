@@ -1299,6 +1299,20 @@ const targets = [_]ArchTarget{
             .name = "Mips",
             .td_name = "Mips",
         },
+        .extra_features = &.{
+            .{
+                .zig_name = "notraps",
+                .desc = "Disable trap instructions",
+                .deps = &.{},
+            },
+        },
+        .extra_cpus = &.{
+            .{
+                .llvm_name = null,
+                .zig_name = "allegrex",
+                .features = &.{ "mips2", "single_float", "notraps" },
+            },
+        },
     },
     .{
         .zig_name = "nvptx",
@@ -1987,7 +2001,6 @@ fn processOneTarget(io: Io, job: Job) void {
 
         const child_result = try std.process.run(arena, io, .{
             .argv = &child_args,
-            .max_output_bytes = 500 * 1024 * 1024,
         });
         tblgen_progress.end();
         if (child_result.stderr.len != 0) {
@@ -1999,7 +2012,15 @@ fn processOneTarget(io: Io, job: Job) void {
                 std.debug.print("llvm-tblgen exited with code {d}\n", .{code});
                 std.process.exit(1);
             },
-            else => {
+            .signal => |sig| {
+                std.debug.print("llvm-tblgen terminated with signal {t}\n", .{sig});
+                std.process.exit(1);
+            },
+            .stopped => |sig| {
+                std.debug.print("llvm-tblgen stopped with signal {t}\n", .{sig});
+                std.process.exit(1);
+            },
+            .unknown => {
                 std.debug.print("llvm-tblgen crashed\n", .{});
                 std.process.exit(1);
             },

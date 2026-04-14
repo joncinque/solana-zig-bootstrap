@@ -275,18 +275,18 @@ pub fn init(
             m.* = .{
                 .owner = owner,
                 .root_source_file = if (options.root_source_file) |lp| lp.dupe(owner) else null,
-                .import_table = .{},
+                .import_table = .empty,
                 .resolved_target = options.target,
                 .optimize = options.optimize,
                 .link_libc = options.link_libc,
                 .link_libcpp = options.link_libcpp,
                 .dwarf_format = options.dwarf_format,
-                .c_macros = .{},
-                .include_dirs = .{},
-                .lib_paths = .{},
-                .rpaths = .{},
-                .frameworks = .{},
-                .link_objects = .{},
+                .c_macros = .empty,
+                .include_dirs = .empty,
+                .lib_paths = .empty,
+                .rpaths = .empty,
+                .frameworks = .empty,
+                .link_objects = .empty,
                 .strip = options.strip,
                 .unwind_tables = options.unwind_tables,
                 .single_threaded = options.single_threaded,
@@ -596,7 +596,7 @@ pub fn appendZigProcessFlags(
                 "-target", try target.query.zigTriple(b.allocator),
                 "-mcpu",   try target.query.serializeCpuAlloc(b.allocator),
             });
-            if (target.query.dynamic_linker) |dynamic_linker| {
+            if (target.query.dynamic_linker) |*dynamic_linker| {
                 if (dynamic_linker.get()) |dynamic_linker_path| {
                     try zig_args.append("--dynamic-linker");
                     try zig_args.append(dynamic_linker_path);

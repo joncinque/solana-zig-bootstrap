@@ -388,6 +388,76 @@ pub const Helper = enum(i32) {
     skc_to_tcp_request_sock,
     skc_to_udp6_sock,
     get_task_stack,
+    load_hdr_opt,
+    store_hdr_opt,
+    reserve_hdr_opt,
+    inode_storage_get,
+    inode_storage_delete,
+    d_path,
+    copy_from_user,
+    snprintf_btf,
+    seq_printf_btf,
+    skb_cgroup_classid,
+    redirect_neigh,
+    per_cpu_ptr,
+    this_cpu_ptr,
+    redirect_peer,
+    task_storage_get,
+    task_storage_delete,
+    get_current_task_btf,
+    bprm_opts_set,
+    ktime_get_coarse_ns,
+    ima_inode_hash,
+    sock_from_file,
+    check_mtu,
+    for_each_map_elem,
+    snprintf,
+    sys_bpf,
+    btf_find_by_name_kind,
+    sys_close,
+    timer_init,
+    timer_set_callback,
+    timer_start,
+    timer_cancel,
+    get_func_ip,
+    get_attach_cookie,
+    task_pt_regs,
+    get_branch_snapshot,
+    trace_vprintk,
+    skc_to_unix_sock,
+    kallsyms_lookup_name,
+    find_vma,
+    loop,
+    strncmp,
+    get_func_arg,
+    get_func_ret,
+    get_func_arg_cnt,
+    get_retval,
+    set_retval,
+    xdp_get_buff_len,
+    xdp_load_bytes,
+    xdp_store_bytes,
+    copy_from_user_task,
+    skb_set_tstamp,
+    ima_file_hash,
+    kptr_xchg,
+    map_lookup_percpu_elem,
+    skc_to_mptcp_sock,
+    dynptr_from_mem,
+    ringbuf_reserve_dynptr,
+    ringbuf_submit_dynptr,
+    ringbuf_discard_dynptr,
+    dynptr_read,
+    dynptr_write,
+    dynptr_data,
+    tcp_raw_gen_syncookie_ipv4,
+    tcp_raw_gen_syncookie_ipv6,
+    tcp_raw_check_syncookie_ipv4,
+    tcp_raw_check_syncookie_ipv6,
+    ktime_get_tai_ns,
+    user_ringbuf_drain,
+    cgrp_storage_get,
+    cgrp_storage_delete,
     _,
 };
 
@@ -1555,7 +1625,7 @@ pub fn map_create(map_type: MapType, key_size: u32, value_size: u32, max_entries
 
 test "map_create" {
     const map = try map_create(.hash, 4, 4, 32);
-    defer std.os.close(map);
+    defer _ = std.os.linux.close(map);
 }
 
 pub fn map_lookup_elem(fd: fd_t, key: []const u8, value: []u8) !void {
@@ -1647,7 +1717,7 @@ test "map lookup, update, and delete" {
     const key_size = 4;
     const value_size = 4;
     const map = try map_create(.hash, key_size, value_size, 1);
-    defer std.os.close(map);
+    defer _ = std.os.linux.close(map);
 
     const key = std.mem.zeroes([key_size]u8);
     var value = std.mem.zeroes([value_size]u8);
@@ -1729,7 +1799,7 @@ test "prog_load" {
     };
 
     const prog = try prog_load(.socket_filter, &good_prog, null, "MIT", 0, 0);
-    defer std.os.close(prog);
+    defer _ = std.os.linux.close(prog);
 
     try expectError(error.UnsafeProgram, prog_load(.socket_filter, &bad_prog, null, "MIT", 0, 0));
 }

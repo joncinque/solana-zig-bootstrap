@@ -138,7 +138,7 @@ const Contents = struct {
 };
 
 const HashToContents = std.StringHashMap(Contents);
-const TargetToHash = std.ArrayHashMap(DestTarget, []const u8, DestTarget.HashContext, true);
+const TargetToHash = std.array_hash_map.Custom(DestTarget, []const u8, DestTarget.HashContext, true);
 const PathTable = std.StringHashMap(*TargetToHash);
 
 pub fn main(init: std.process.Init) !void {
@@ -146,7 +146,7 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const args = try init.minimal.args.toSlice(arena);
     const environ_map = init.environ_map;
-    const cwd = try std.process.getCwdAlloc(arena);
+    const cwd = try std.process.currentPathAlloc(io, arena);
 
     var search_paths = std.array_list.Managed([]const u8).init(arena);
     var opt_out_dir: ?[]const u8 = null;
@@ -239,11 +239,11 @@ pub fn main(init: std.process.Init) !void {
                             const path_gop = try path_table.getOrPut(rel_path);
                             const target_to_hash = if (path_gop.found_existing) path_gop.value_ptr.* else blk: {
                                 const ptr = try arena.create(TargetToHash);
-                                ptr.* = TargetToHash.init(arena);
+                                ptr.* = .empty;
                                 path_gop.value_ptr.* = ptr;
                                 break :blk ptr;
                             };
-                            try target_to_hash.putNoClobber(dest_target, hash);
+                            try target_to_hash.putNoClobber(arena, dest_target, hash);
                         },
                         else => std.debug.print("warning: weird file: {s}\n", .{full_path}),
                     }

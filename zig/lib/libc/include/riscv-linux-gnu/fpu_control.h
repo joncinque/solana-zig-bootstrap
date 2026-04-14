@@ -1,5 +1,5 @@
 /* FPU control word bits.  RISC-V version.
-   Copyright (C) 1996-2025 Free Software Foundation, Inc.
+   Copyright (C) 1996-2026 Free Software Foundation, Inc.
    This file is part of the GNU C Library.
 
    The GNU C Library is free software; you can redistribute it and/or
@@ -27,7 +27,7 @@
 # define _FPU_DEFAULT  0x00000000
 typedef unsigned int fpu_control_t;
 # define _FPU_GETCW(cw) (cw) = 0
-# define _FPU_SETCW(cw) do { } while (0)
+# define _FPU_SETCW(cw) (void) (cw)
 extern fpu_control_t __fpu_control;
 
 #else /* __riscv_flen */

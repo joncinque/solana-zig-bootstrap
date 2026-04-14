@@ -1,6 +1,6 @@
 /* Set flags signalling availability of kernel features based on given
    kernel version number.
-   Copyright (C) 1999-2025 Free Software Foundation, Inc.
+   Copyright (C) 1999-2026 Free Software Foundation, Inc.
    This file is part of the GNU C Library.
 
    The GNU C Library is free software; you can redistribute it and/or
@@ -260,5 +260,10 @@
 #else
 # define __ASSUME_FCHMODAT2 0
 #endif
+
+/* The mseal system call was introduced across all architectures in Linux 6.10
+   (although only supported on 64-bit CPUs).  */
+/* zig patch: don't assume kernel version */
+#define __ASSUME_MSEAL 0
 
 #endif /* kernel-features.h */

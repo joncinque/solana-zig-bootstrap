@@ -7,6 +7,7 @@ const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 const DW = std.dwarf;
 const log = std.log.scoped(.llvm);
+const maxInt = std.math.maxInt;
 const Writer = std.Io.Writer;
 
 const bitcode_writer = @import("bitcode_writer.zig");
@@ -55,6 +56,8 @@ constant_items: std.MultiArrayList(Constant.Item),
 constant_extra: std.ArrayList(u32),
 constant_limbs: std.ArrayList(std.math.big.Limb),
 
+alignment_forward_references: std.ArrayList(Alignment),
+
 metadata_map: std.AutoArrayHashMapUnmanaged(void, void),
 metadata_items: std.MultiArrayList(Metadata.Item),
 metadata_extra: std.ArrayList(u32),
@@ -85,7 +88,7 @@ pub const Options = struct {
 };
 
 pub const String = enum(u32) {
-    none = std.math.maxInt(u31),
+    none = maxInt(u31),
     empty,
     _,
 
@@ -245,7 +248,7 @@ pub const Type = enum(u32) {
     ptr,
     @"ptr addrspace(4)",
 
-    none = std.math.maxInt(u32),
+    none = maxInt(u32),
     _,
 
     pub const ptr_amdgpu_constant =
@@ -941,7 +944,7 @@ pub const Attribute = union(Kind) {
     inalloca: Type,
     sret: Type,
     elementtype: Type,
-    @"align": Alignment,
+    @"align": Alignment.Lazy,
     @"noalias",
     nocapture,
     nofree,
@@ -956,7 +959,7 @@ pub const Attribute = union(Kind) {
     immarg,
     noundef,
     nofpclass: FpClass,
-    alignstack: Alignment,
+    alignstack: Alignment.Lazy,
     allocalign,
     allocptr,
     readnone,
@@ -964,7 +967,7 @@ pub const Attribute = union(Kind) {
     writeonly,
 
     // Function Attributes
-    //alignstack: Alignment,
+    //alignstack: Alignment.Lazy,
     allockind: AllocKind,
     allocsize: AllocSize,
     alwaysinline,
@@ -1145,7 +1148,7 @@ pub const Attribute = union(Kind) {
                     return @unionInit(Attribute, field.name, switch (field.type) {
                         void => {},
                         u32 => storage.value,
-                        Alignment, String, Type, UwTable => @enumFromInt(storage.value),
+                        Alignment.Lazy, String, Type, UwTable => @enumFromInt(storage.value),
                         AllocKind, AllocSize, FpClass, Memory, VScaleRange => @bitCast(storage.value),
                         else => @compileError("bad payload type: " ++ field.name ++ ": " ++
                             @typeName(field.type)),
@@ -1246,7 +1249,7 @@ pub const Attribute = union(Kind) {
                 .sret,
                 .elementtype,
                 => |ty| try w.print(" {s}({f})", .{ @tagName(attribute), ty.fmt(data.builder, .percent) }),
-                .@"align" => |alignment| try w.print("{f}", .{alignment.fmt(" ")}),
+                .@"align" => |alignment| try w.print("{f}", .{alignment.resolve(data.builder).fmt(" ")}),
                 .dereferenceable,
                 .dereferenceable_or_null,
                 => |size| try w.print(" {s}({d})", .{ @tagName(attribute), size }),
@@ -1270,7 +1273,7 @@ pub const Attribute = union(Kind) {
                 },
                 .alignstack => |alignment| {
                     try w.print(" {t}", .{attribute});
-                    const alignment_bytes = alignment.toByteUnits() orelse return;
+                    const alignment_bytes = alignment.resolve(data.builder).toByteUnits() orelse return;
                     if (data.flags.pound) {
                         try w.print("={d}", .{alignment_bytes});
                     } else {
@@ -1435,8 +1438,8 @@ pub const Attribute = union(Kind) {
         //sanitize_memtag,
         sanitize_address_dyninit = 102,
 
-        string = std.math.maxInt(u31),
-        none = std.math.maxInt(u32),
+        string = maxInt(u31),
+        none = maxInt(u32),
         _,
 
         pub const len = @typeInfo(Kind).@"enum".fields.len - 2;
@@ -1516,12 +1519,12 @@ pub const Attribute = union(Kind) {
         elem_size: u16,
         num_elems: u16,
 
-        pub const none = std.math.maxInt(u16);
+        pub const none = maxInt(u16);
 
         fn toLlvm(self: AllocSize) packed struct(u64) { num_elems: u32, elem_size: u32 } {
             return .{ .num_elems = switch (self.num_elems) {
                 else => self.num_elems,
-                none => std.math.maxInt(u32),
+                none => maxInt(u32),
             }, .elem_size = self.elem_size };
         }
     };
@@ -1577,7 +1580,7 @@ pub const Attribute = union(Kind) {
             inline else => |value, tag| .{ .kind = @as(Kind, self), .value = switch (@TypeOf(value)) {
                 void => 0,
                 u32 => value,
-                Alignment, String, Type, UwTable => @intFromEnum(value),
+                Alignment.Lazy, String, Type, UwTable => @intFromEnum(value),
                 AllocKind, AllocSize, FpClass, Memory, VScaleRange => @bitCast(value),
                 else => @compileError("bad payload type: " ++ @tagName(tag) ++ @typeName(@TypeOf(value))),
             } },
@@ -1627,7 +1630,7 @@ pub const FunctionAttributes = enum(u32) {
     const params_index = 2;
 
     pub const Wip = struct {
-        maps: Maps = .{},
+        maps: Maps = .empty,
 
         const Map = std.AutoArrayHashMapUnmanaged(Attribute.Kind, Attribute.Index);
         const Maps = std.ArrayList(Map);
@@ -2017,8 +2020,31 @@ pub const ExternallyInitialized = enum {
 };
 
 pub const Alignment = enum(u6) {
-    default = std.math.maxInt(u6),
+    default = maxInt(u6),
     _,
+
+    pub const Lazy = enum(u32) {
+        /// Values which fit in a `u6` are already-resolved `Alignment` values. Other values are
+        /// indices into `Builder.alignment_forward_references`, offset by `maxInt(u6)`.
+        _,
+
+        pub fn wrap(a: Alignment) Lazy {
+            return @enumFromInt(@intFromEnum(a));
+        }
+        pub fn resolve(l: Lazy, b: *const Builder) Alignment {
+            return switch (@intFromEnum(l)) {
+                0...maxInt(u6) => |raw| @enumFromInt(raw),
+                else => |offset_index| b.alignment_forward_references.items[offset_index - maxInt(u6)],
+            };
+        }
+
+        fn fromFwdRefIndex(index: usize) Lazy {
+            return @enumFromInt(index + maxInt(u6));
+        }
+        fn toFwdRefIndex(l: Lazy) usize {
+            return @intFromEnum(l) - maxInt(u6);
+        }
+    };
 
     pub fn fromByteUnits(bytes: u64) Alignment {
         if (bytes == 0) return .default;
@@ -2028,11 +2054,17 @@ pub const Alignment = enum(u6) {
     }
 
     pub fn toByteUnits(self: Alignment) ?u64 {
-        return if (self == .default) null else @as(u64, 1) << @intFromEnum(self);
+        return switch (self) {
+            .default => null,
+            else => @as(u64, 1) << @intFromEnum(self),
+        };
     }
 
     pub fn toLlvm(self: Alignment) u6 {
-        return if (self == .default) 0 else (@intFromEnum(self) + 1);
+        return switch (self) {
+            .default => 0,
+            else => @intFromEnum(self) + 1,
+        };
     }
 
     pub const Prefixed = struct {
@@ -2180,7 +2212,7 @@ pub const CallConv = enum(u10) {
 };
 
 pub const StrtabString = enum(u32) {
-    none = std.math.maxInt(u31),
+    none = maxInt(u31),
     empty,
     _,
 
@@ -2308,15 +2340,16 @@ pub const Global = struct {
     },
 
     pub const Index = enum(u32) {
-        none = std.math.maxInt(u32),
+        none = maxInt(u32),
         _,
 
-        pub fn unwrap(self: Index, builder: *const Builder) Index {
-            var cur = self;
+        pub fn unwrap(orig_index: Index, builder: *const Builder) Index {
+            var cur = orig_index;
             while (true) {
-                const replacement = cur.getReplacement(builder);
-                if (replacement == .none) return cur;
-                cur = replacement;
+                switch (builder.globals.values()[@intFromEnum(cur)].kind) {
+                    .replaced => |replacement| cur = replacement,
+                    else => return cur,
+                }
             }
         }
 
@@ -2356,8 +2389,12 @@ pub const Global = struct {
             return self.ptrConst(builder).type;
         }
 
-        pub fn toConst(self: Index) Constant {
-            return @enumFromInt(@intFromEnum(Constant.first_global) + @intFromEnum(self));
+        pub fn toConst(global: Index) Constant {
+            return @enumFromInt(@intFromEnum(Constant.first_global) + @intFromEnum(global));
+        }
+
+        pub fn toValue(global: Index) Value {
+            return global.toConst().toValue();
         }
 
         pub fn setLinkage(self: Index, linkage: Linkage, builder: *Builder) void {
@@ -2418,6 +2455,42 @@ pub const Global = struct {
             self.ptr(builder).kind = .{ .replaced = .none };
         }
 
+        /// Replaces whatever this `Global` currently contains with a new `Function`. Similar to
+        /// `Builder.addFunction`, but the same `Global` is reused.
+        pub fn toNewFunction(global: Index, builder: *Builder) Allocator.Error!Function.Index {
+            try builder.functions.ensureUnusedCapacity(builder.gpa, 1);
+            errdefer comptime unreachable;
+            const function: Function.Index = @enumFromInt(builder.functions.items.len);
+            builder.functions.appendAssumeCapacity(.{
+                .global = global,
+                .strip = undefined,
+            });
+            global.ptr(builder).kind = .{ .function = function };
+            return function;
+        }
+
+        /// Replaces whatever this `Global` currently contains with a new `Variable`. Similar to
+        /// `Builder.addVariable`, but the same `Global` is reused.
+        pub fn toNewVariable(global: Index, builder: *Builder) Allocator.Error!Variable.Index {
+            try builder.variables.ensureUnusedCapacity(builder.gpa, 1);
+            errdefer comptime unreachable;
+            const variable: Variable.Index = @enumFromInt(builder.variables.items.len);
+            builder.variables.appendAssumeCapacity(.{ .global = global });
+            global.ptr(builder).kind = .{ .variable = variable };
+            return variable;
+        }
+
+        /// Replaces whatever this `Global` currently contains with a new `Alias`. Similar to
+        /// `Builder.addAlias`, but the same `Global` is reused.
+        pub fn toNewAlias(global: Index, builder: *Builder) Allocator.Error!Alias.Index {
+            try builder.aliases.ensureUnusedCapacity(builder.gpa, 1);
+            errdefer comptime unreachable;
+            const alias: Alias.Index = @enumFromInt(builder.aliases.items.len);
+            builder.aliass.appendAssumeCapacity(.{ .global = global, .aliasee = .none });
+            global.ptr(builder).kind = .{ .alias = alias };
+            return alias;
+        }
+
         fn updateDsoLocal(self: Index, builder: *Builder) void {
             const self_ptr = self.ptr(builder);
             switch (self_ptr.linkage) {
@@ -2462,13 +2535,6 @@ pub const Global = struct {
             self.renameAssumeCapacity(builder.next_replaced_global, builder);
             self.ptr(builder).kind = .{ .replaced = other.unwrap(builder) };
         }
-
-        fn getReplacement(self: Index, builder: *const Builder) Index {
-            return switch (builder.globals.values()[@intFromEnum(self)].kind) {
-                .replaced => |replacement| replacement,
-                else => .none,
-            };
-        }
     };
 };
 
@@ -2478,7 +2544,7 @@ pub const Alias = struct {
     aliasee: Constant = .no_init,
 
     pub const Index = enum(u32) {
-        none = std.math.maxInt(u32),
+        none = maxInt(u32),
         _,
 
         pub fn ptr(self: Index, builder: *Builder) *Alias {
@@ -2530,7 +2596,7 @@ pub const Variable = struct {
     alignment: Alignment = .default,
 
     pub const Index = enum(u32) {
-        none = std.math.maxInt(u32),
+        none = maxInt(u32),
         _,
 
         pub fn ptr(self: Index, builder: *Builder) *Variable {
@@ -2559,22 +2625,6 @@ pub const Variable = struct {
 
         pub fn toValue(self: Index, builder: *const Builder) Value {
             return self.toConst(builder).toValue();
-        }
-
-        pub fn setLinkage(self: Index, linkage: Linkage, builder: *Builder) void {
-            return self.ptrConst(builder).global.setLinkage(linkage, builder);
-        }
-
-        pub fn setVisibility(self: Index, visibility: Visibility, builder: *Builder) void {
-            return self.ptrConst(builder).global.setVisibility(visibility, builder);
-        }
-
-        pub fn setDllStorageClass(self: Index, class: DllStorageClass, builder: *Builder) void {
-            return self.ptrConst(builder).global.setDllStorageClass(class, builder);
-        }
-
-        pub fn setUnnamedAddr(self: Index, unnamed_addr: UnnamedAddr, builder: *Builder) void {
-            return self.ptrConst(builder).global.setUnnamedAddr(unnamed_addr, builder);
         }
 
         pub fn setThreadLocal(self: Index, thread_local: ThreadLocal, builder: *Builder) void {
@@ -3949,7 +3999,7 @@ pub const Intrinsic = enum {
             .params = &.{
                 .{
                     .kind = .{ .type = Type.ptr_amdgpu_constant },
-                    .attrs = &.{.{ .@"align" = Builder.Alignment.fromByteUnits(4) }},
+                    .attrs = &.{.{ .@"align" = .wrap(.fromByteUnits(4)) }},
                 },
             },
             .attrs = &.{ .nocallback, .nofree, .nosync, .nounwind, .speculatable, .willreturn, .{ .memory = Attribute.Memory.all(.none) } },
@@ -4048,7 +4098,7 @@ pub const Function = struct {
     section: String = .none,
     alignment: Alignment = .default,
     blocks: []const Block = &.{},
-    instructions: std.MultiArrayList(Instruction) = .{},
+    instructions: std.MultiArrayList(Instruction) = .empty,
     names: [*]const String = &[0]String{},
     value_indices: [*]const u32 = &[0]u32{},
     strip: bool,
@@ -4057,7 +4107,7 @@ pub const Function = struct {
     extra: []const u32 = &.{},
 
     pub const Index = enum(u32) {
-        none = std.math.maxInt(u32),
+        none = maxInt(u32),
         _,
 
         pub fn ptr(self: Index, builder: *Builder) *Function {
@@ -4411,7 +4461,7 @@ pub const Function = struct {
         };
 
         pub const Index = enum(u32) {
-            none = std.math.maxInt(u31),
+            none = maxInt(u31),
             _,
 
             pub fn name(self: Instruction.Index, function: *const Function) String {
@@ -5007,7 +5057,7 @@ pub const Function = struct {
                 fsub = 12,
                 fmax = 13,
                 fmin = 14,
-                none = std.math.maxInt(u5),
+                none = maxInt(u5),
             };
         };
 
@@ -5222,13 +5272,13 @@ pub const WipFunction = struct {
             .prev_debug_location = .no_location,
             .debug_location = .no_location,
             .cursor = undefined,
-            .blocks = .{},
-            .instructions = .{},
-            .names = .{},
+            .blocks = .empty,
+            .instructions = .empty,
+            .names = .empty,
             .strip = options.strip,
-            .debug_locations = .{},
-            .debug_values = .{},
-            .extra = .{},
+            .debug_locations = .empty,
+            .debug_values = .empty,
+            .extra = .empty,
         };
         errdefer self.deinit();
 
@@ -5265,7 +5315,7 @@ pub const WipFunction = struct {
         self.blocks.appendAssumeCapacity(.{
             .name = final_name,
             .incoming = incoming,
-            .instructions = .{},
+            .instructions = .empty,
         });
         return index;
     }
@@ -6132,8 +6182,8 @@ pub const WipFunction = struct {
         kind: MemoryAccessKind,
         @"inline": bool,
     ) Allocator.Error!Instruction.Index {
-        var dst_attrs = [_]Attribute.Index{try self.builder.attr(.{ .@"align" = dst_align })};
-        var src_attrs = [_]Attribute.Index{try self.builder.attr(.{ .@"align" = src_align })};
+        var dst_attrs = [_]Attribute.Index{try self.builder.attr(.{ .@"align" = .wrap(dst_align) })};
+        var src_attrs = [_]Attribute.Index{try self.builder.attr(.{ .@"align" = .wrap(src_align) })};
         const value = try self.callIntrinsic(
             .normal,
             try self.builder.fnAttrs(&.{
@@ -6162,8 +6212,8 @@ pub const WipFunction = struct {
         len: Value,
         kind: MemoryAccessKind,
     ) Allocator.Error!Instruction.Index {
-        var dst_attrs = [_]Attribute.Index{try self.builder.attr(.{ .@"align" = dst_align })};
-        var src_attrs = [_]Attribute.Index{try self.builder.attr(.{ .@"align" = src_align })};
+        var dst_attrs = [_]Attribute.Index{try self.builder.attr(.{ .@"align" = .wrap(dst_align) })};
+        var src_attrs = [_]Attribute.Index{try self.builder.attr(.{ .@"align" = .wrap(src_align) })};
         const value = try self.callIntrinsic(
             .normal,
             try self.builder.fnAttrs(&.{
@@ -6192,7 +6242,7 @@ pub const WipFunction = struct {
         kind: MemoryAccessKind,
         @"inline": bool,
     ) Allocator.Error!Instruction.Index {
-        var dst_attrs = [_]Attribute.Index{try self.builder.attr(.{ .@"align" = dst_align })};
+        var dst_attrs = [_]Attribute.Index{try self.builder.attr(.{ .@"align" = .wrap(dst_align) })};
         const value = try self.callIntrinsic(
             .normal,
             try self.builder.fnAttrs(&.{ .none, .none, try self.builder.attrs(&dst_attrs) }),
@@ -6325,7 +6375,7 @@ pub const WipFunction = struct {
         function.blocks = &.{};
         gpa.free(function.names[0..function.instructions.len]);
         function.debug_locations.deinit(gpa);
-        function.debug_locations = .{};
+        function.debug_locations = .empty;
         gpa.free(function.debug_values);
         function.debug_values = &.{};
         gpa.free(function.extra);
@@ -7329,7 +7379,7 @@ pub const Constant = enum(u32) {
         //indices: [info.indices_len]Constant,
 
         pub const Kind = enum { normal, inbounds };
-        pub const InRangeIndex = enum(u16) { none = std.math.maxInt(u16), _ };
+        pub const InRangeIndex = enum(u16) { none = maxInt(u16), _ };
         pub const Info = packed struct(u32) { indices_len: u16, inrange: InRangeIndex };
     };
 
@@ -7579,7 +7629,7 @@ pub const Constant = enum(u32) {
                             string: [
                                 (std.math.big.int.Const{
                                     .limbs = &([1]std.math.big.Limb{
-                                        std.math.maxInt(std.math.big.Limb),
+                                        maxInt(std.math.big.Limb),
                                     } ** expected_limbs),
                                     .positive = false,
                                 }).sizeInBaseUpperBound(10)
@@ -7643,7 +7693,7 @@ pub const Constant = enum(u32) {
                                     std.math.minInt(Exponent64),
                                 else => @as(Exponent64, repr.exponent) +
                                     (std.math.floatExponentMax(f64) - std.math.floatExponentMax(f32)),
-                                std.math.maxInt(Exponent32) => std.math.maxInt(Exponent64),
+                                maxInt(Exponent32) => maxInt(Exponent64),
                             },
                             .sign = repr.sign,
                         }))});
@@ -7820,7 +7870,7 @@ pub const Constant = enum(u32) {
 };
 
 pub const Value = enum(u32) {
-    none = std.math.maxInt(u31),
+    none = maxInt(u31),
     false = first_constant + @intFromEnum(Constant.false),
     true = first_constant + @intFromEnum(Constant.true),
     @"0" = first_constant + @intFromEnum(Constant.@"0"),
@@ -8021,6 +8071,7 @@ pub const Metadata = packed struct(u32) {
         composite_vector_type,
         derived_pointer_type,
         derived_member_type,
+        derived_typedef_type,
         subroutine_type,
         enumerator_unsigned,
         enumerator_signed_positive,
@@ -8064,6 +8115,7 @@ pub const Metadata = packed struct(u32) {
                 .composite_vector_type,
                 .derived_pointer_type,
                 .derived_member_type,
+                .derived_typedef_type,
                 .subroutine_type,
                 .enumerator_unsigned,
                 .enumerator_signed_positive,
@@ -8391,7 +8443,7 @@ pub const Metadata = packed struct(u32) {
         map: std.AutoArrayHashMapUnmanaged(union(enum) {
             metadata: Metadata,
             debug_location: DebugLocation.Location,
-        }, void) = .{},
+        }, void) = .empty,
 
         const FormatData = struct {
             formatter: *Formatter,
@@ -8649,52 +8701,54 @@ pub fn init(options: Options) Allocator.Error!Builder {
         .source_filename = .none,
         .data_layout = .none,
         .target_triple = .none,
-        .module_asm = .{},
+        .module_asm = .empty,
 
-        .string_map = .{},
-        .string_indices = .{},
-        .string_bytes = .{},
+        .string_map = .empty,
+        .string_indices = .empty,
+        .string_bytes = .empty,
 
-        .types = .{},
+        .types = .empty,
         .next_unnamed_type = @enumFromInt(0),
-        .next_unique_type_id = .{},
-        .type_map = .{},
-        .type_items = .{},
-        .type_extra = .{},
+        .next_unique_type_id = .empty,
+        .type_map = .empty,
+        .type_items = .empty,
+        .type_extra = .empty,
 
-        .attributes = .{},
-        .attributes_map = .{},
-        .attributes_indices = .{},
-        .attributes_extra = .{},
+        .attributes = .empty,
+        .attributes_map = .empty,
+        .attributes_indices = .empty,
+        .attributes_extra = .empty,
 
-        .function_attributes_set = .{},
+        .function_attributes_set = .empty,
 
-        .globals = .{},
+        .globals = .empty,
         .next_unnamed_global = @enumFromInt(0),
         .next_replaced_global = .none,
-        .next_unique_global_id = .{},
-        .aliases = .{},
-        .variables = .{},
-        .functions = .{},
+        .next_unique_global_id = .empty,
+        .aliases = .empty,
+        .variables = .empty,
+        .functions = .empty,
 
-        .strtab_string_map = .{},
-        .strtab_string_indices = .{},
-        .strtab_string_bytes = .{},
+        .strtab_string_map = .empty,
+        .strtab_string_indices = .empty,
+        .strtab_string_bytes = .empty,
 
-        .constant_map = .{},
-        .constant_items = .{},
-        .constant_extra = .{},
-        .constant_limbs = .{},
+        .constant_map = .empty,
+        .constant_items = .empty,
+        .constant_extra = .empty,
+        .constant_limbs = .empty,
 
-        .metadata_map = .{},
-        .metadata_items = .{},
-        .metadata_extra = .{},
-        .metadata_limbs = .{},
-        .metadata_forward_references = .{},
-        .metadata_named = .{},
-        .metadata_string_map = .{},
-        .metadata_string_indices = .{},
-        .metadata_string_bytes = .{},
+        .alignment_forward_references = .empty,
+
+        .metadata_map = .empty,
+        .metadata_items = .empty,
+        .metadata_extra = .empty,
+        .metadata_limbs = .empty,
+        .metadata_forward_references = .empty,
+        .metadata_named = .empty,
+        .metadata_string_map = .empty,
+        .metadata_string_indices = .empty,
+        .metadata_string_bytes = .empty,
     };
     errdefer self.deinit();
 
@@ -8798,51 +8852,55 @@ pub fn clearAndFree(self: *Builder) void {
 }
 
 pub fn deinit(self: *Builder) void {
-    self.module_asm.deinit(self.gpa);
+    const gpa = self.gpa;
 
-    self.string_map.deinit(self.gpa);
-    self.string_indices.deinit(self.gpa);
-    self.string_bytes.deinit(self.gpa);
+    self.module_asm.deinit(gpa);
 
-    self.types.deinit(self.gpa);
-    self.next_unique_type_id.deinit(self.gpa);
-    self.type_map.deinit(self.gpa);
-    self.type_items.deinit(self.gpa);
-    self.type_extra.deinit(self.gpa);
+    self.string_map.deinit(gpa);
+    self.string_indices.deinit(gpa);
+    self.string_bytes.deinit(gpa);
 
-    self.attributes.deinit(self.gpa);
-    self.attributes_map.deinit(self.gpa);
-    self.attributes_indices.deinit(self.gpa);
-    self.attributes_extra.deinit(self.gpa);
+    self.types.deinit(gpa);
+    self.next_unique_type_id.deinit(gpa);
+    self.type_map.deinit(gpa);
+    self.type_items.deinit(gpa);
+    self.type_extra.deinit(gpa);
 
-    self.function_attributes_set.deinit(self.gpa);
+    self.attributes.deinit(gpa);
+    self.attributes_map.deinit(gpa);
+    self.attributes_indices.deinit(gpa);
+    self.attributes_extra.deinit(gpa);
 
-    self.globals.deinit(self.gpa);
-    self.next_unique_global_id.deinit(self.gpa);
-    self.aliases.deinit(self.gpa);
-    self.variables.deinit(self.gpa);
-    for (self.functions.items) |*function| function.deinit(self.gpa);
-    self.functions.deinit(self.gpa);
+    self.function_attributes_set.deinit(gpa);
 
-    self.strtab_string_map.deinit(self.gpa);
-    self.strtab_string_indices.deinit(self.gpa);
-    self.strtab_string_bytes.deinit(self.gpa);
+    self.globals.deinit(gpa);
+    self.next_unique_global_id.deinit(gpa);
+    self.aliases.deinit(gpa);
+    self.variables.deinit(gpa);
+    for (self.functions.items) |*function| function.deinit(gpa);
+    self.functions.deinit(gpa);
 
-    self.constant_map.deinit(self.gpa);
-    self.constant_items.deinit(self.gpa);
-    self.constant_extra.deinit(self.gpa);
-    self.constant_limbs.deinit(self.gpa);
+    self.strtab_string_map.deinit(gpa);
+    self.strtab_string_indices.deinit(gpa);
+    self.strtab_string_bytes.deinit(gpa);
 
-    self.metadata_map.deinit(self.gpa);
-    self.metadata_items.deinit(self.gpa);
-    self.metadata_extra.deinit(self.gpa);
-    self.metadata_limbs.deinit(self.gpa);
-    self.metadata_forward_references.deinit(self.gpa);
-    self.metadata_named.deinit(self.gpa);
+    self.constant_map.deinit(gpa);
+    self.constant_items.deinit(gpa);
+    self.constant_extra.deinit(gpa);
+    self.constant_limbs.deinit(gpa);
 
-    self.metadata_string_map.deinit(self.gpa);
-    self.metadata_string_indices.deinit(self.gpa);
-    self.metadata_string_bytes.deinit(self.gpa);
+    self.alignment_forward_references.deinit(gpa);
+
+    self.metadata_map.deinit(gpa);
+    self.metadata_items.deinit(gpa);
+    self.metadata_extra.deinit(gpa);
+    self.metadata_limbs.deinit(gpa);
+    self.metadata_forward_references.deinit(gpa);
+    self.metadata_named.deinit(gpa);
+
+    self.metadata_string_map.deinit(gpa);
+    self.metadata_string_indices.deinit(gpa);
+    self.metadata_string_bytes.deinit(gpa);
 
     self.* = undefined;
 }
@@ -8960,7 +9018,7 @@ pub fn structType(
 pub fn opaqueType(self: *Builder, name: String) Allocator.Error!Type {
     try self.string_map.ensureUnusedCapacity(self.gpa, 1);
     if (name.slice(self)) |id| {
-        const count: usize = comptime std.fmt.count("{d}", .{std.math.maxInt(u32)});
+        const count: usize = comptime std.fmt.count("{d}", .{maxInt(u32)});
         try self.string_bytes.ensureUnusedCapacity(self.gpa, id.len + count);
     }
     try self.string_indices.ensureUnusedCapacity(self.gpa, 1);
@@ -9576,6 +9634,21 @@ pub fn asmValue(
     return (try self.asmConst(ty, info, assembly, constraints)).toValue();
 }
 
+/// The initial "resolved" value of the forward reference is `Alignment.default`.
+pub fn alignmentForwardReference(b: *Builder) Allocator.Error!Alignment.Lazy {
+    const index = b.alignment_forward_references.items.len;
+    try b.alignment_forward_references.append(b.gpa, .default);
+    return .fromFwdRefIndex(index);
+}
+
+/// Updates the "resolved" value of the alignment forward reference `fwd_ref` to `value`.
+///
+/// Asserts that `fwd_ref` is a forward reference, as opposed to a resolved alignment value.
+pub fn resolveAlignmentForwardReference(b: *Builder, fwd_ref: Alignment.Lazy, value: Alignment) void {
+    const index = fwd_ref.toFwdRefIndex();
+    b.alignment_forward_references.items[index] = value;
+}
+
 pub fn dump(b: *Builder, io: Io) void {
     var buffer: [4000]u8 = undefined;
     const stderr: Io.File = .stderr();
@@ -9637,8 +9710,12 @@ pub fn print(self: *Builder, w: *Writer) (Writer.Error || Allocator.Error)!void 
 
     if (self.variables.items.len > 0) {
         if (need_newline) try w.writeByte('\n') else need_newline = true;
-        for (self.variables.items) |variable| {
-            if (variable.global.getReplacement(self) != .none) continue;
+        for (self.variables.items, 0..) |variable, variable_i| {
+            // Skip the variable if its global has been repurposed for something else.
+            switch (variable.global.ptrConst(self).kind) {
+                .variable => |v| if (@intFromEnum(v) != variable_i) continue,
+                else => continue,
+            }
             const global = variable.global.ptrConst(self);
             metadata_formatter.need_comma = true;
             defer metadata_formatter.need_comma = undefined;
@@ -9668,8 +9745,12 @@ pub fn print(self: *Builder, w: *Writer) (Writer.Error || Allocator.Error)!void 
 
     if (self.aliases.items.len > 0) {
         if (need_newline) try w.writeByte('\n') else need_newline = true;
-        for (self.aliases.items) |alias| {
-            if (alias.global.getReplacement(self) != .none) continue;
+        for (self.aliases.items, 0..) |alias, alias_i| {
+            // Skip the alias if its global has been repurposed for something else.
+            switch (alias.global.ptrConst(self).kind) {
+                .alias => |a| if (@intFromEnum(a) != alias_i) continue,
+                else => continue,
+            }
             const global = alias.global.ptrConst(self);
             metadata_formatter.need_comma = true;
             defer metadata_formatter.need_comma = undefined;
@@ -9695,7 +9776,11 @@ pub fn print(self: *Builder, w: *Writer) (Writer.Error || Allocator.Error)!void 
     defer attribute_groups.deinit(self.gpa);
 
     for (0.., self.functions.items) |function_i, function| {
-        if (function.global.getReplacement(self) != .none) continue;
+        // Skip the function if its global has been repurposed for something else.
+        switch (function.global.ptrConst(self).kind) {
+            .function => |f| if (@intFromEnum(f) != function_i) continue,
+            else => continue,
+        }
         if (need_newline) try w.writeByte('\n') else need_newline = true;
         const function_index: Function.Index = @enumFromInt(function_i);
         const global = function.global.ptrConst(self);
@@ -10463,15 +10548,18 @@ pub fn print(self: *Builder, w: *Writer) (Writer.Error || Allocator.Error)!void 
                 },
                 .derived_pointer_type,
                 .derived_member_type,
+                .derived_typedef_type,
                 => |kind| {
                     const extra = self.metadataExtraData(Metadata.DerivedType, metadata_item.data);
                     try metadata_formatter.specialized(.@"!", .DIDerivedType, .{
                         .tag = @as(enum {
                             DW_TAG_pointer_type,
                             DW_TAG_member,
+                            DW_TAG_typedef,
                         }, switch (kind) {
                             .derived_pointer_type => .DW_TAG_pointer_type,
                             .derived_member_type => .DW_TAG_member,
+                            .derived_typedef_type => .DW_TAG_typedef,
                             else => unreachable,
                         }),
                         .name = extra.name,
@@ -10510,7 +10598,7 @@ pub fn print(self: *Builder, w: *Writer) (Writer.Error || Allocator.Error)!void 
                         string: [
                             (std.math.big.int.Const{
                                 .limbs = &([1]std.math.big.Limb{
-                                    std.math.maxInt(std.math.big.Limb),
+                                    maxInt(std.math.big.Limb),
                                 } ** expected_limbs),
                                 .positive = false,
                             }).sizeInBaseUpperBound(10)
@@ -10660,7 +10748,7 @@ fn printEscapedString(slice: []const u8, quotes: QuoteBehavior, w: *Writer) Writ
 fn ensureUnusedGlobalCapacity(self: *Builder, name: StrtabString) Allocator.Error!void {
     try self.strtab_string_map.ensureUnusedCapacity(self.gpa, 1);
     if (name.slice(self)) |id| {
-        const count: usize = comptime std.fmt.count("{d}", .{std.math.maxInt(u32)});
+        const count: usize = comptime std.fmt.count("{d}", .{maxInt(u32)});
         try self.strtab_string_bytes.ensureUnusedCapacity(self.gpa, id.len + count);
     }
     try self.strtab_string_indices.ensureUnusedCapacity(self.gpa, 1);
@@ -12069,7 +12157,7 @@ pub fn trailingMetadataStringAssumeCapacity(self: *Builder) Metadata.String {
     const start = self.metadata_string_indices.getLast();
     const bytes: []const u8 = self.metadata_string_bytes.items[start..];
     assert(bytes.len > 0);
-    const gop = self.metadata_string_map.getOrPutAssumeCapacityAdapted(bytes, String.Adapter{ .builder = self });
+    const gop = self.metadata_string_map.getOrPutAssumeCapacityAdapted(bytes, Metadata.String.Adapter{ .builder = self });
     if (gop.found_existing) {
         self.metadata_string_bytes.shrinkRetainingCapacity(start);
     } else {
@@ -12360,6 +12448,30 @@ pub fn debugMemberType(
     );
 }
 
+pub fn debugTypedefType(
+    self: *Builder,
+    name: ?Metadata.String,
+    file: ?Metadata,
+    scope: ?Metadata,
+    line: u32,
+    underlying_type: ?Metadata,
+    size_in_bits: u64,
+    align_in_bits: u64,
+    offset_in_bits: u64,
+) Allocator.Error!Metadata {
+    try self.ensureUnusedMetadataCapacity(1, Metadata.DerivedType, 0);
+    return self.debugTypedefTypeAssumeCapacity(
+        name,
+        file,
+        scope,
+        line,
+        underlying_type,
+        size_in_bits,
+        align_in_bits,
+        offset_in_bits,
+    );
+}
+
 pub fn debugSubroutineType(self: *Builder, types_tuple: ?Metadata) Allocator.Error!Metadata {
     try self.ensureUnusedMetadataCapacity(1, Metadata.SubroutineType, 0);
     return self.debugSubroutineTypeAssumeCapacity(types_tuple);
@@ -12467,11 +12579,12 @@ pub fn metadataConstant(self: *Builder, value: Constant) Allocator.Error!Metadat
     return self.metadataConstantAssumeCapacity(value);
 }
 
+/// Resolves the given forward reference to the given value (which is not itself a forward
+/// reference). If the forward reference is already resolved, its target is replaced.
 pub fn resolveDebugForwardReference(self: *Builder, fwd_ref: Metadata, value: Metadata) void {
     assert(fwd_ref.kind == .forward);
-    const resolved = &self.metadata_forward_references.items[fwd_ref.index];
-    assert(resolved.is_none);
-    resolved.* = value.toOptional();
+    assert(value.kind != .forward);
+    self.metadata_forward_references.items[fwd_ref.index] = value.toOptional();
 }
 
 fn metadataSimpleAssumeCapacity(self: *Builder, tag: Metadata.Tag, value: anytype) Metadata {
@@ -12860,6 +12973,33 @@ fn debugMemberTypeAssumeCapacity(
 ) Metadata {
     assert(!self.strip);
     return self.metadataSimpleAssumeCapacity(.derived_member_type, Metadata.DerivedType{
+        .name = .wrap(name),
+        .file = .wrap(file),
+        .scope = .wrap(scope),
+        .line = line,
+        .underlying_type = .wrap(underlying_type),
+        .size_in_bits_lo = @truncate(size_in_bits),
+        .size_in_bits_hi = @truncate(size_in_bits >> 32),
+        .align_in_bits_lo = @truncate(align_in_bits),
+        .align_in_bits_hi = @truncate(align_in_bits >> 32),
+        .offset_in_bits_lo = @truncate(offset_in_bits),
+        .offset_in_bits_hi = @truncate(offset_in_bits >> 32),
+    });
+}
+
+fn debugTypedefTypeAssumeCapacity(
+    self: *Builder,
+    name: ?Metadata.String,
+    file: ?Metadata,
+    scope: ?Metadata,
+    line: u32,
+    underlying_type: ?Metadata,
+    size_in_bits: u64,
+    align_in_bits: u64,
+    offset_in_bits: u64,
+) Metadata {
+    assert(!self.strip);
+    return self.metadataSimpleAssumeCapacity(.derived_typedef_type, Metadata.DerivedType{
         .name = .wrap(name),
         .file = .wrap(file),
         .scope = .wrap(scope),
@@ -13461,7 +13601,7 @@ pub fn toBitcode(self: *Builder, allocator: Allocator, producer: Producer) bitco
                                 try record.ensureUnusedCapacity(self.gpa, 3);
                                 record.appendAssumeCapacity(1);
                                 record.appendAssumeCapacity(@intFromEnum(kind));
-                                record.appendAssumeCapacity(alignment.toByteUnits() orelse 0);
+                                record.appendAssumeCapacity(alignment.resolve(self).toByteUnits() orelse 0);
                             },
                             .dereferenceable,
                             .dereferenceable_or_null,
@@ -13577,20 +13717,32 @@ pub fn toBitcode(self: *Builder, allocator: Allocator, producer: Producer) bitco
                 self.aliases.items.len,
         );
 
-        for (self.variables.items) |variable| {
-            if (variable.global.getReplacement(self) != .none) continue;
+        for (self.variables.items, 0..) |variable, variable_i| {
+            // Skip the variable if its global has been repurposed for something else.
+            switch (variable.global.ptrConst(self).kind) {
+                .variable => |v| if (@intFromEnum(v) != variable_i) continue,
+                else => continue,
+            }
 
             globals.putAssumeCapacity(variable.global, {});
         }
 
-        for (self.functions.items) |function| {
-            if (function.global.getReplacement(self) != .none) continue;
+        for (self.functions.items, 0..) |function, function_i| {
+            // Skip the function if its global has been repurposed for something else.
+            switch (function.global.ptrConst(self).kind) {
+                .function => |f| if (@intFromEnum(f) != function_i) continue,
+                else => continue,
+            }
 
             globals.putAssumeCapacity(function.global, {});
         }
 
-        for (self.aliases.items) |alias| {
-            if (alias.global.getReplacement(self) != .none) continue;
+        for (self.aliases.items, 0..) |alias, alias_i| {
+            // Skip the alias if its global has been repurposed for something else.
+            switch (alias.global.ptrConst(self).kind) {
+                .alias => |a| if (@intFromEnum(a) != alias_i) continue,
+                else => continue,
+            }
 
             globals.putAssumeCapacity(alias.global, {});
         }
@@ -13632,8 +13784,12 @@ pub fn toBitcode(self: *Builder, allocator: Allocator, producer: Producer) bitco
             defer section_map.deinit(self.gpa);
             try section_map.ensureUnusedCapacity(self.gpa, globals.count());
 
-            for (self.variables.items) |variable| {
-                if (variable.global.getReplacement(self) != .none) continue;
+            for (self.variables.items, 0..) |variable, variable_i| {
+                // Skip the variable if its global has been repurposed for something else.
+                switch (variable.global.ptrConst(self).kind) {
+                    .variable => |v| if (@intFromEnum(v) != variable_i) continue,
+                    else => continue,
+                }
 
                 const section = blk: {
                     if (variable.section == .none) break :blk 0;
@@ -13679,8 +13835,12 @@ pub fn toBitcode(self: *Builder, allocator: Allocator, producer: Producer) bitco
                 });
             }
 
-            for (self.functions.items) |func| {
-                if (func.global.getReplacement(self) != .none) continue;
+            for (self.functions.items, 0..) |func, func_i| {
+                // Skip the function if its global has been repurposed for something else.
+                switch (func.global.ptrConst(self).kind) {
+                    .function => |f| if (@intFromEnum(f) != func_i) continue,
+                    else => continue,
+                }
 
                 const section = blk: {
                     if (func.section == .none) break :blk 0;
@@ -13720,8 +13880,12 @@ pub fn toBitcode(self: *Builder, allocator: Allocator, producer: Producer) bitco
                 });
             }
 
-            for (self.aliases.items) |alias| {
-                if (alias.global.getReplacement(self) != .none) continue;
+            for (self.aliases.items, 0..) |alias, alias_i| {
+                // Skip the alias if its global has been repurposed for something else.
+                switch (alias.global.ptrConst(self).kind) {
+                    .alias => |a| if (@intFromEnum(a) != alias_i) continue,
+                    else => continue,
+                }
 
                 const strtab = alias.global.strtab(self);
 
@@ -14222,12 +14386,14 @@ pub fn toBitcode(self: *Builder, allocator: Allocator, producer: Producer) bitco
                     },
                     .derived_pointer_type,
                     .derived_member_type,
+                    .derived_typedef_type,
                     => |kind| {
                         const extra = self.metadataExtraData(Metadata.DerivedType, data);
                         try metadata_block.writeAbbrevAdapted(MetadataBlock.DerivedType{
                             .tag = switch (kind) {
                                 .derived_pointer_type => DW.TAG.pointer_type,
                                 .derived_member_type => DW.TAG.member,
+                                .derived_typedef_type => DW.TAG.typedef,
                                 else => unreachable,
                             },
                             .name = extra.name,
@@ -14523,8 +14689,13 @@ pub fn toBitcode(self: *Builder, allocator: Allocator, producer: Producer) bitco
             };
 
             for (self.functions.items, 0..) |func, func_index| {
+                // Skip the function if its global has been repurposed for something else.
+                switch (func.global.ptrConst(self).kind) {
+                    .function => |f| if (@intFromEnum(f) != func_index) continue,
+                    else => continue,
+                }
+
                 const FunctionBlock = ir.ModuleBlock.FunctionBlock;
-                if (func.global.getReplacement(self) != .none) continue;
 
                 if (func.instructions.len == 0) continue;
 

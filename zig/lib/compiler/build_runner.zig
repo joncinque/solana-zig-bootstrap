@@ -30,20 +30,19 @@ pub fn main(init: process.Init.Minimal) !void {
     defer _ = debug_gpa_state.deinit();
     const gpa = debug_gpa_state.allocator();
 
-    // ...but we'll back our arena by `std.heap.page_allocator` for efficiency.
-    var single_threaded_arena: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
-    defer single_threaded_arena.deinit();
-    var thread_safe_arena: std.heap.ThreadSafeAllocator = .{ .child_allocator = single_threaded_arena.allocator() };
-    const arena = thread_safe_arena.allocator();
-
-    const args = try init.args.toSlice(arena);
-
     var threaded: std.Io.Threaded = .init(gpa, .{
         .environ = init.environ,
         .argv0 = .init(init.args),
     });
     defer threaded.deinit();
     const io = threaded.io();
+
+    // ...but we'll back our arena by `std.heap.page_allocator` for efficiency.
+    var arena_instance: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+
+    const args = try init.args.toSlice(arena);
 
     // skip my own exe name
     var arg_idx: usize = 1;
@@ -83,7 +82,7 @@ pub fn main(init: process.Init.Minimal) !void {
             .io = io,
             .gpa = gpa,
             .manifest_dir = try local_cache_directory.handle.createDirPathOpen(io, "h", .{}),
-            .cwd = try process.getCwdAlloc(single_threaded_arena.allocator()),
+            .cwd = try process.currentPathAlloc(io, arena),
         },
         .zig_exe = zig_exe,
         .environ_map = try init.environ.createMap(arena),
@@ -307,7 +306,11 @@ pub fn main(init: process.Init.Minimal) !void {
             } else if (mem.eql(u8, arg, "--debug-pkg-config")) {
                 builder.debug_pkg_config = true;
             } else if (mem.eql(u8, arg, "--debug-rt")) {
-                graph.debug_compiler_runtime_libs = true;
+                graph.debug_compiler_runtime_libs = .Debug;
+            } else if (mem.cutPrefix(u8, arg, "--debug-rt=")) |rest| {
+                graph.debug_compiler_runtime_libs =
+                    std.meta.stringToEnum(std.builtin.OptimizeMode, rest) orelse
+                    fatal("unrecognized optimization mode: '{s}'", .{rest});
             } else if (mem.eql(u8, arg, "--debug-compile-errors")) {
                 builder.debug_compile_errors = true;
             } else if (mem.eql(u8, arg, "--debug-incremental")) {
@@ -421,6 +424,7 @@ pub fn main(init: process.Init.Minimal) !void {
                     fatal("unable to parse jobs count '{s}': {t}", .{ text, err });
                 if (n < 1) fatal("number of jobs must be at least 1", .{});
                 threaded.setAsyncLimit(.limited(n));
+                graph.max_jobs = n;
             } else if (mem.eql(u8, arg, "--")) {
                 builder.args = argsRest(args, arg_idx);
                 break;
@@ -529,7 +533,7 @@ pub fn main(init: process.Init.Minimal) !void {
     }
 
     prepare(arena, builder, targets.items, &run, graph.random_seed) catch |err| switch (err) {
-        error.DependencyLoopDetected => {
+        error.DependencyLoopDetected, error.InsufficientMemory => {
             // Perhaps in the future there could be an Advanced Options flag
             // such as --debug-build-runner-leaks which would make this code
             // return instead of calling exit.
@@ -545,7 +549,7 @@ pub fn main(init: process.Init.Minimal) !void {
         break :w try .init(graph.cache.cwd);
     };
 
-    const now = Io.Clock.Timestamp.now(io, .awake) catch |err| fatal("failed to collect timestamp: {t}", .{err});
+    const now = Io.Clock.Timestamp.now(io, .awake);
 
     run.web_server = if (webui_listen) |listen_address| ws: {
         if (builtin.single_threaded) unreachable; // `fatal` above
@@ -618,7 +622,7 @@ pub fn main(init: process.Init.Minimal) !void {
         }) catch &caption_buf;
         var debouncing_node = main_progress_node.start(caption, 0);
         var in_debounce = false;
-        while (true) switch (try w.wait(gpa, if (in_debounce) .{ .ms = debounce_interval_ms } else .none)) {
+        while (true) switch (try w.wait(gpa, io, if (in_debounce) .{ .ms = debounce_interval_ms } else .none)) {
             .timeout => {
                 assert(in_debounce);
                 debouncing_node.end();
@@ -693,8 +697,8 @@ fn prepare(
         for (0..step_names.len) |i| {
             const step_name = step_names[step_names.len - i - 1];
             const s = b.top_level_steps.get(step_name) orelse {
-                std.debug.print("no step named '{s}'\n  access the help menu with 'zig build -h'\n", .{step_name});
-                process.exit(1);
+                std.log.info("access the help menu with \"zig build -h\"", .{});
+                fatal("no step named '{s}'", .{step_name});
             };
             step_stack.putAssumeCapacity(&s.step, {});
         }
@@ -713,8 +717,10 @@ fn prepare(
     {
         // Check that we have enough memory to complete the build.
         var any_problems = false;
+        var max_needed: usize = 0;
         for (step_stack.keys()) |s| {
             if (s.max_rss == 0) continue;
+            max_needed = @max(max_needed, s.max_rss);
             if (s.max_rss > run.available_rss) {
                 if (run.skip_oom_steps) {
                     s.state = .skipped_oom;
@@ -722,7 +728,7 @@ fn prepare(
                         dependant.pending_deps -= 1;
                     }
                 } else {
-                    std.debug.print("{s}{s}: this step declares an upper bound of {d} bytes of memory, exceeding the available {d} bytes of memory\n", .{
+                    std.log.err("{s}{s}: this step declares an upper bound of {d} bytes of memory, exceeding the available {d} bytes of memory", .{
                         s.owner.dep_prefix, s.name, s.max_rss, run.available_rss,
                     });
                     any_problems = true;
@@ -731,8 +737,11 @@ fn prepare(
         }
         if (any_problems) {
             if (run.max_rss_is_default) {
-                std.debug.print("note: use --maxrss to override the default", .{});
+                std.log.info("use --maxrss {d} to proceed, risking system memory exhaustion", .{
+                    max_needed,
+                });
             }
+            return error.InsufficientMemory;
         }
     }
 }
@@ -1570,6 +1579,23 @@ fn printUsage(b: *std.Build, w: *Writer) !void {
         \\  -fsys=[name]                 Enable a system integration
         \\  -fno-sys=[name]              Disable a system integration
         \\
+        \\  -fdarling,  -fno-darling     Integration with system-installed Darling to
+        \\                               execute macOS programs on Linux hosts
+        \\                               (default: no)
+        \\  -fqemu,     -fno-qemu        Integration with system-installed QEMU to execute
+        \\                               foreign-architecture programs on Linux hosts
+        \\                               (default: no)
+        \\  --libc-runtimes [path]       Enhances QEMU integration by providing dynamic libc
+        \\                               (e.g. glibc or musl) built for multiple foreign
+        \\                               architectures, allowing execution of non-native
+        \\                               programs that link with libc.
+        \\  -frosetta,  -fno-rosetta     Rely on Rosetta to execute x86_64 programs on
+        \\                               ARM64 macOS hosts. (default: no)
+        \\  -fwasmtime, -fno-wasmtime    Integration with system-installed wasmtime to
+        \\                               execute WASI binaries. (default: no)
+        \\  -fwine,     -fno-wine        Integration with system-installed Wine to execute
+        \\                               Windows programs on Linux hosts. (default: no)
+        \\
         \\  Available System Integrations:                Enabled:
         \\
     );
@@ -1589,33 +1615,16 @@ fn printUsage(b: *std.Build, w: *Writer) !void {
     try w.writeAll(
         \\
         \\General Options:
+        \\  -h, --help                   Print this help and exit
+        \\  -l, --list-steps             Print available steps
+        \\
         \\  -p, --prefix [path]          Where to install files (default: zig-out)
         \\  --prefix-lib-dir [path]      Where to install libraries
         \\  --prefix-exe-dir [path]      Where to install executables
         \\  --prefix-include-dir [path]  Where to install C header files
-        \\
         \\  --release[=mode]             Request release mode, optionally specifying a
         \\                               preferred optimization mode: fast, safe, small
         \\
-        \\  -fdarling,  -fno-darling     Integration with system-installed Darling to
-        \\                               execute macOS programs on Linux hosts
-        \\                               (default: no)
-        \\  -fqemu,     -fno-qemu        Integration with system-installed QEMU to execute
-        \\                               foreign-architecture programs on Linux hosts
-        \\                               (default: no)
-        \\  --libc-runtimes [path]       Enhances QEMU integration by providing dynamic libc
-        \\                               (e.g. glibc or musl) built for multiple foreign
-        \\                               architectures, allowing execution of non-native
-        \\                               programs that link with libc.
-        \\  -frosetta,  -fno-rosetta     Rely on Rosetta to execute x86_64 programs on
-        \\                               ARM64 macOS hosts. (default: no)
-        \\  -fwasmtime, -fno-wasmtime    Integration with system-installed wasmtime to
-        \\                               execute WASI binaries. (default: no)
-        \\  -fwine,     -fno-wine        Integration with system-installed Wine to execute
-        \\                               Windows programs on Linux hosts. (default: no)
-        \\
-        \\  -h, --help                   Print this help and exit
-        \\  -l, --list-steps             Print available steps
         \\  --verbose                    Print commands before executing them
         \\  --color [auto|off|on]        Enable or disable colored error messages
         \\  --error-style [style]        Control how build errors are printed
@@ -1638,9 +1647,6 @@ fn printUsage(b: *std.Build, w: *Writer) !void {
         \\  --skip-oom-steps             Instead of failing, skip steps that would exceed --maxrss
         \\  --test-timeout <timeout>     Limit execution time of unit tests, terminating if exceeded.
         \\                               The timeout must include a unit: ns, us, ms, s, m, h
-        \\  --fetch[=mode]               Fetch dependency tree (optionally choose laziness) and exit
-        \\    needed                     (Default) Lazy dependencies are fetched as needed
-        \\    all                        Lazy dependencies are always fetched
         \\  --watch                      Continuously rebuild when source files are modified
         \\  --debounce <ms>              Delay before rebuilding after changed file detected
         \\  --webui[=ip]                 Enable the web interface on the given IP address
@@ -1652,6 +1658,12 @@ fn printUsage(b: *std.Build, w: *Writer) !void {
         \\                               compilation time of Zig source code (implies '--webui')
         \\     -fincremental             Enable incremental compilation
         \\  -fno-incremental             Disable incremental compilation
+        \\
+        \\Package Management Options:
+        \\  --fetch[=mode]               Fetch dependency tree (optionally choose laziness) and exit
+        \\    needed                     (Default) Lazy dependencies are fetched as needed
+        \\    all                        Lazy dependencies are always fetched
+        \\  --fork=[path]                Override one or more projects from dependency tree
         \\
         \\Advanced Options:
         \\  -freference-trace[=num]      How many lines of reference trace should be shown per compile error

@@ -38,6 +38,10 @@ pub const Alignment = enum(math.Log2Int(usize)) {
         return @enumFromInt(@ctz(n));
     }
 
+    pub fn fromByteUnitsOptional(maybe_n: ?usize) ?Alignment {
+        return if (maybe_n) |n| .fromByteUnits(n) else null;
+    }
+
     pub inline fn of(comptime T: type) Alignment {
         return comptime fromByteUnits(@alignOf(T));
     }
@@ -1122,63 +1126,6 @@ pub const indexOfSentinel = findSentinel;
 /// Linear search through memory until the sentinel is found.
 pub fn findSentinel(comptime T: type, comptime sentinel: T, p: [*:sentinel]const T) usize {
     var i: usize = 0;
-
-    if (use_vectors_for_comparison and
-        !std.debug.inValgrind() and // https://github.com/ziglang/zig/issues/17717
-        !@inComptime() and
-        (@typeInfo(T) == .int or @typeInfo(T) == .float) and std.math.isPowerOfTwo(@bitSizeOf(T)))
-    {
-        switch (@import("builtin").cpu.arch) {
-            // The below branch assumes that reading past the end of the buffer is valid, as long
-            // as we don't read into a new page. This should be the case for most architectures
-            // which use paged memory, however should be confirmed before adding a new arch below.
-            .aarch64, .x86, .x86_64 => if (std.simd.suggestVectorLength(T)) |block_len| {
-                const page_size = std.heap.page_size_min;
-                const block_size = @sizeOf(T) * block_len;
-                const Block = @Vector(block_len, T);
-                const mask: Block = @splat(sentinel);
-
-                comptime assert(std.heap.page_size_min % @sizeOf(Block) == 0);
-                assert(page_size % @sizeOf(Block) == 0);
-
-                // First block may be unaligned
-                const start_addr = @intFromPtr(&p[i]);
-                const offset_in_page = start_addr & (page_size - 1);
-                if (offset_in_page <= page_size - @sizeOf(Block)) {
-                    // Will not read past the end of a page, full block.
-                    const block: Block = p[i..][0..block_len].*;
-                    const matches = block == mask;
-                    if (@reduce(.Or, matches)) {
-                        return i + std.simd.firstTrue(matches).?;
-                    }
-
-                    i += @divExact(std.mem.alignForward(usize, start_addr, block_size) - start_addr, @sizeOf(T));
-                } else {
-                    @branchHint(.unlikely);
-                    // Would read over a page boundary. Per-byte at a time until aligned or found.
-                    // 0.39% chance this branch is taken for 4K pages at 16b block length.
-                    //
-                    // An alternate strategy is to do read a full block (the last in the page) and
-                    // mask the entries before the pointer.
-                    while ((@intFromPtr(&p[i]) & (block_size - 1)) != 0) : (i += 1) {
-                        if (p[i] == sentinel) return i;
-                    }
-                }
-
-                std.debug.assertAligned(&p[i], .fromByteUnits(block_size));
-                while (true) {
-                    const block: Block = p[i..][0..block_len].*;
-                    const matches = block == mask;
-                    if (@reduce(.Or, matches)) {
-                        return i + std.simd.firstTrue(matches).?;
-                    }
-                    i += block_len;
-                }
-            },
-            else => {},
-        }
-    }
-
     while (p[i] != sentinel) {
         i += 1;
     }
@@ -1823,7 +1770,7 @@ test containsAtLeastScalar2 {
 }
 
 /// Reads an integer from memory with size equal to bytes.len.
-/// T specifies the return type, which must be large enough to store
+/// ReturnType specifies the return type, which must be large enough to store
 /// the result.
 pub fn readVarInt(comptime ReturnType: type, bytes: []const u8, endian: Endian) ReturnType {
     assert(@typeInfo(ReturnType).int.bits >= bytes.len * 8);
@@ -2287,8 +2234,8 @@ pub fn byteSwapAllFieldsAligned(comptime S: type, comptime a: Alignment, ptr: *a
                 ptr.* = @bitCast(@byteSwap(@as(Int, @bitCast(ptr.*))));
             } else inline for (std.meta.fields(S)) |f| {
                 switch (@typeInfo(f.type)) {
-                    .@"struct" => byteSwapAllFieldsAligned(f.type, .fromByteUnits(f.alignment), &@field(ptr, f.name)),
-                    .@"union", .array => byteSwapAllFieldsAligned(f.type, .fromByteUnits(f.alignment), &@field(ptr, f.name)),
+                    .@"struct" => byteSwapAllFieldsAligned(f.type, .fromByteUnits(f.alignment orelse @alignOf(f.type)), &@field(ptr, f.name)),
+                    .@"union", .array => byteSwapAllFieldsAligned(f.type, .fromByteUnits(f.alignment orelse @alignOf(f.type)), &@field(ptr, f.name)),
                     .@"enum" => {
                         @field(ptr, f.name) = @enumFromInt(@byteSwap(@intFromEnum(@field(ptr, f.name))));
                     },
@@ -3458,7 +3405,7 @@ pub fn SplitIterator(comptime T: type, comptime delimiter_type: DelimiterType) t
 
         /// Returns a slice of the next field, or null if splitting is complete.
         /// This method does not alter self.index.
-        pub fn peek(self: *Self) ?[]const T {
+        pub fn peek(self: *const Self) ?[]const T {
             const start = self.index orelse return null;
             const end = if (switch (delimiter_type) {
                 .sequence => findPos(T, self.buffer, start, self.delimiter),
@@ -4002,7 +3949,9 @@ test reverse {
         try testing.expectEqualSlices(MyType, &arr, &([_]MyType{ .c, .{ .b = 0 }, .{ .a = .{ 0, 0, 0 } } }));
     }
 }
-fn ReverseIterator(comptime T: type) type {
+
+/// Returned by `reverseIterator`.
+pub fn ReverseIterator(comptime T: type) type {
     const ptr = switch (@typeInfo(T)) {
         .pointer => |ptr| ptr,
         else => @compileError("expected slice or pointer to array, found '" ++ @typeName(T) ++ "'"),
@@ -4328,7 +4277,7 @@ pub fn alignPointerOffset(ptr: anytype, align_to: usize) ?usize {
         @compileError("expected many item pointer, got " ++ @typeName(T));
 
     // Do nothing if the pointer is already well-aligned.
-    if (align_to <= info.pointer.alignment)
+    if (align_to <= info.pointer.alignment orelse @alignOf(info.pointer.child))
         return 0;
 
     // Calculate the aligned base address with an eye out for overflow.
@@ -4386,7 +4335,11 @@ fn CopyPtrAttrs(
         .@"const" = ptr.is_const,
         .@"volatile" = ptr.is_volatile,
         .@"allowzero" = ptr.is_allowzero,
-        .@"align" = ptr.alignment,
+        .@"align" = ptr.alignment orelse a: {
+            // If the new child is aligned differently than the old one, explicitly align the type.
+            const want = @alignOf(ptr.child);
+            break :a if (@alignOf(child) == want) null else want;
+        },
         .@"addrspace" = ptr.address_space,
     }, child, null);
 }
@@ -4754,6 +4707,54 @@ test "sliceAsBytes preserves pointer attributes" {
     try testing.expectEqual(in.is_volatile, out.is_volatile);
     try testing.expectEqual(in.is_allowzero, out.is_allowzero);
     try testing.expectEqual(in.alignment, out.alignment);
+}
+
+fn AbsorbSentinelReturnType(comptime Slice: type) type {
+    const info = @typeInfo(Slice).pointer;
+    assert(info.size == .slice);
+    return @Pointer(.slice, .{
+        .@"const" = info.is_const,
+        .@"volatile" = info.is_volatile,
+        .@"allowzero" = info.is_allowzero,
+        .@"addrspace" = info.address_space,
+        .@"align" = info.alignment,
+    }, info.child, null);
+}
+
+/// If the provided slice is not sentinel terminated, do nothing and return that slice.
+/// If it is sentinel-terminated, return a non-sentinel-terminated slice with the
+/// length increased by one to include the absorbed sentinel element.
+pub fn absorbSentinel(slice: anytype) AbsorbSentinelReturnType(@TypeOf(slice)) {
+    const info = @typeInfo(@TypeOf(slice)).pointer;
+    comptime assert(info.size == .slice);
+    if (info.sentinel_ptr == null) {
+        return slice;
+    } else {
+        return slice.ptr[0 .. slice.len + 1];
+    }
+}
+
+test absorbSentinel {
+    {
+        var buffer: [3:0]u8 = .{ 1, 2, 3 };
+        const foo: [:0]const u8 = &buffer;
+        const bar: []const u8 = &buffer;
+        try testing.expectEqual([]const u8, @TypeOf(absorbSentinel(foo)));
+        try testing.expectEqual([]const u8, @TypeOf(absorbSentinel(bar)));
+        try testing.expectEqualSlices(u8, &.{ 1, 2, 3, 0 }, absorbSentinel(foo));
+        try testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, absorbSentinel(bar));
+    }
+    {
+        var buffer: [3:0]u8 = .{ 1, 2, 3 };
+        const foo: [:0]u8 = &buffer;
+        const bar: []u8 = &buffer;
+        try testing.expectEqual([]u8, @TypeOf(absorbSentinel(foo)));
+        try testing.expectEqual([]u8, @TypeOf(absorbSentinel(bar)));
+        var expected_foo = [_]u8{ 1, 2, 3, 0 };
+        try testing.expectEqualSlices(u8, &expected_foo, absorbSentinel(foo));
+        var expected_bar = [_]u8{ 1, 2, 3 };
+        try testing.expectEqualSlices(u8, &expected_bar, absorbSentinel(bar));
+    }
 }
 
 /// Round an address down to the next (or current) aligned address.

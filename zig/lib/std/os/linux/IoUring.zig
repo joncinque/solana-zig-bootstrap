@@ -67,7 +67,7 @@ pub fn init_params(entries: u16, p: *linux.io_uring_params) !IoUring {
     }
     const fd = @as(linux.fd_t, @intCast(res));
     assert(fd >= 0);
-    errdefer posix.close(fd);
+    errdefer _ = linux.close(fd);
 
     // Kernel versions 5.4 and up use only one mmap() for the submission and completion queues.
     // This is not an optional feature for us... if the kernel does it, we have to do it.
@@ -125,7 +125,7 @@ pub fn deinit(self: *IoUring) void {
     // The mmaps depend on the fd, so the order of these calls is important:
     self.cq.deinit();
     self.sq.deinit();
-    posix.close(self.fd);
+    _ = linux.close(self.fd);
     self.fd = -1;
 }
 
@@ -201,6 +201,10 @@ pub fn enter(self: *IoUring, to_submit: u32, min_complete: u32, flags: u32) !u32
         // The kernel believes our `self.fd` does not refer to an io_uring instance,
         // or the opcode is valid but not supported by this kernel (more likely):
         .OPNOTSUPP => return error.OpcodeNotSupported,
+        // The thread submitting the work is invalid. This may occur if IORING_ENTER_GETEVENTS
+        // and IORING_SETUP_DEFER_TASKRUN is set, but the submitting thread is not the thread
+        // that initially created or enabled the io_uring associated with fd.
+        .EXIST => return error.InvalidThread,
         // The operation was interrupted by a delivery of a signal before it could complete.
         // This can happen while waiting for events with IORING_ENTER_GETEVENTS:
         .INTR => return error.SignalInterrupt,

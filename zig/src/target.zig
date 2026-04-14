@@ -10,10 +10,24 @@ const Feature = @import("Zcu.zig").Feature;
 
 pub const default_stack_protector_buffer_size = 4;
 
-pub fn cannotDynamicLink(target: *const std.Target) bool {
-    return switch (target.os.tag) {
-        .freestanding => true,
-        else => target.cpu.arch.isSpirV(),
+pub fn canDynamicLink(target: *const std.Target) bool {
+    return switch (target.cpu.arch) {
+        .amdgcn,
+        .bpfeb,
+        .bpfel,
+        .nvptx,
+        .nvptx64,
+        .spirv32,
+        .spirv64,
+        => false,
+        .wasm32,
+        .wasm64,
+        => true,
+        else => switch (target.os.tag) {
+            // This list is likely incomplete.
+            .freestanding, .uefi => false,
+            else => true,
+        },
     };
 }
 
@@ -39,11 +53,19 @@ pub fn libCxxNeedsLibUnwind(target: *const std.Target) bool {
 }
 
 /// This function returns whether non-pic code is completely invalid on the given target.
-pub fn requiresPIC(target: *const std.Target, linking_libc: bool) bool {
-    return target.abi.isAndroid() or
-        target.os.tag == .windows or target.os.tag == .uefi or
+pub fn requiresPic(target: *const std.Target, linking_libc: bool) bool {
+    return ((target.os.tag == .windows or target.os.tag == .uefi) and (target.cpu.arch == .aarch64 or target.cpu.arch == .x86_64)) or
         target.requiresLibC() or
         (linking_libc and target.isGnuLibC());
+}
+
+pub fn requiresPicForDynamicLink(target: *const std.Target) bool {
+    assert(canDynamicLink(target));
+
+    return switch (target.os.tag) {
+        .windows => target.cpu.arch == .aarch64 or target.cpu.arch == .x86_64,
+        else => !target.cpu.arch.isWasm(),
+    };
 }
 
 pub fn picLevel(target: *const std.Target) u32 {
@@ -56,10 +78,15 @@ pub fn picLevel(target: *const std.Target) u32 {
 /// C compiler argument is valid to Clang.
 pub fn supports_fpic(target: *const std.Target) bool {
     return switch (target.os.tag) {
-        .windows,
-        .uefi,
-        => target.abi == .gnu,
+        .windows, .uefi => false, // Technically allowed for `Abi.gnu`, but completely ignored by Clang (by design) anyway.
         else => true,
+    };
+}
+
+pub fn defaultPie(target: *const std.Target) bool {
+    return switch (target.os.tag) {
+        .openbsd => true,
+        else => target.os.tag.isDarwin(),
     };
 }
 
@@ -400,6 +427,12 @@ pub fn canBuildLibUbsanRt(target: *const std.Target) enum { no, yes, llvm_only, 
         .stage2_x86_64 => .yes,
         else => .llvm_only,
     };
+}
+
+/// Whether libzigc can fill-in the gaps of an existing libc
+/// or *is* the libc of the target.
+pub fn wantsZigC(target: *const std.Target, link_mode: std.builtin.LinkMode) bool {
+    return (target.isMuslLibC() and link_mode == .static) or target.isWasiLibC() or target.isMinGW();
 }
 
 pub fn hasRedZone(target: *const std.Target) bool {
@@ -877,6 +910,7 @@ pub inline fn backendSupportsFeature(backend: std.builtin.CompilerBackend, compt
             .stage2_llvm,
             .stage2_x86_64,
             .stage2_riscv64,
+            .stage2_wasm,
             => true,
             else => false,
         },

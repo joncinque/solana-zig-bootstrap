@@ -1,11 +1,11 @@
 /* Generated at libc build time from syscall list.  */
-/* The system call list corresponds to kernel 6.15.  */
+/* The system call list corresponds to kernel 6.17.  */
 
 #ifndef _SYSCALL_H
 # error "Never use <bits/syscall.h> directly; include <sys/syscall.h> instead."
 #endif
 
-#define __GLIBC_LINUX_VERSION_CODE 397056
+#define __GLIBC_LINUX_VERSION_CODE 397568
 
 #ifdef __NR_FAST_atomic_update
 # define SYS_FAST_atomic_update __NR_FAST_atomic_update
@@ -409,6 +409,14 @@
 
 #ifdef __NR_fgetxattr
 # define SYS_fgetxattr __NR_fgetxattr
+#endif
+
+#ifdef __NR_file_getattr
+# define SYS_file_getattr __NR_file_getattr
+#endif
+
+#ifdef __NR_file_setattr
+# define SYS_file_setattr __NR_file_setattr
 #endif
 
 #ifdef __NR_finit_module

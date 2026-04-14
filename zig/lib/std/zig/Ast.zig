@@ -160,14 +160,25 @@ pub fn parse(gpa: Allocator, source: [:0]const u8, mode: Mode) Allocator.Error!A
         if (token.tag == .eof) break;
     }
 
+    var tokens_slice = tokens.toOwnedSlice();
+    errdefer tokens_slice.deinit(gpa);
+    return parseTokens(gpa, source, tokens_slice, mode);
+}
+
+pub fn parseTokens(
+    gpa: Allocator,
+    source: [:0]const u8,
+    tokens: Ast.TokenList.Slice,
+    mode: Mode,
+) Allocator.Error!Ast {
     var parser: Parse = .{
         .source = source,
         .gpa = gpa,
-        .tokens = tokens.slice(),
-        .errors = .{},
-        .nodes = .{},
-        .extra_data = .{},
-        .scratch = .{},
+        .tokens = tokens,
+        .errors = .empty,
+        .nodes = .empty,
+        .extra_data = .empty,
+        .scratch = .empty,
         .tok_i = 0,
     };
     defer parser.errors.deinit(gpa);
@@ -194,7 +205,7 @@ pub fn parse(gpa: Allocator, source: [:0]const u8, mode: Mode) Allocator.Error!A
     return Ast{
         .source = source,
         .mode = mode,
-        .tokens = tokens.toOwnedSlice(),
+        .tokens = tokens,
         .nodes = parser.nodes.toOwnedSlice(),
         .extra_data = extra_data,
         .errors = errors,
@@ -492,9 +503,6 @@ pub fn renderError(tree: Ast, parse_error: Error, w: *Writer) Writer.Error!void 
         },
         .varargs_nonfinal => {
             return w.writeAll("function prototype has parameter after varargs");
-        },
-        .expected_continue_expr => {
-            return w.writeAll("expected ':' before while continue expression");
         },
 
         .expected_semi_after_decl => {
@@ -2125,10 +2133,12 @@ fn fullPtrTypeComponents(tree: Ast, info: full.PtrType.Components) full.PtrType 
     // here while looking for modifiers as that could result in false
     // positives. Therefore, start after a sentinel if there is one and
     // skip over any align node and bit range nodes.
-    var i = if (info.sentinel.unwrap()) |sentinel| tree.lastToken(sentinel) + 1 else switch (size) {
-        .many, .c => info.main_token + 1,
-        else => info.main_token,
-    };
+    var i = (if (info.sentinel.unwrap()) |sentinel| tree.lastToken(sentinel) + 1 else switch (size) {
+        .one => info.main_token,
+        .slice => info.main_token + 1,
+        .many => info.main_token + 2,
+        .c => info.main_token + 3,
+    }) + 1;
     const end = tree.firstToken(info.child_type);
     while (i < end) : (i += 1) {
         switch (tree.tokenTag(i)) {
@@ -2136,15 +2146,15 @@ fn fullPtrTypeComponents(tree: Ast, info: full.PtrType.Components) full.PtrType 
             .keyword_const => result.const_token = i,
             .keyword_volatile => result.volatile_token = i,
             .keyword_align => {
-                const align_node = info.align_node.unwrap().?;
                 if (info.bit_range_end.unwrap()) |bit_range_end| {
                     assert(info.bit_range_start != .none);
                     i = tree.lastToken(bit_range_end) + 1;
-                } else {
+                } else if (info.align_node.unwrap()) |align_node| {
                     i = tree.lastToken(align_node) + 1;
-                }
+                } else unreachable;
             },
-            else => {},
+            .keyword_addrspace => i = tree.lastToken(info.addrspace_node.unwrap().?) + 1,
+            else => unreachable,
         }
     }
     return result;
@@ -2875,7 +2885,6 @@ pub const Error = struct {
         test_doc_comment,
         comptime_doc_comment,
         varargs_nonfinal,
-        expected_continue_expr,
         expected_semi_after_decl,
         expected_semi_after_stmt,
         expected_comma_after_field,

@@ -1,5 +1,5 @@
 /* Memory-mapping-related declarations/definitions, not architecture-specific.
-   Copyright (C) 2017-2025 Free Software Foundation, Inc.
+   Copyright (C) 2017-2026 Free Software Foundation, Inc.
    This file is part of the GNU C Library.
 
    The GNU C Library is free software; you can redistribute it and/or
@@ -84,6 +84,16 @@ int pkey_free (int __key) __THROW;
 /* Apply memory protection flags for KEY to the specified address
    range.  */
 int pkey_mprotect (void *__addr, size_t __len, int __prot, int __pkey) __THROW;
+
+/* Seal the address range to avoid further modifications, such as remapping to
+   shrink or expand the VMA, changing protection permission with mprotect,
+   unmap with munmap, or destructive semantics such as madvise with
+   MADV_DONTNEED.
+
+   The address range must be a valid VMA, without any gaps (unallocated
+   memory) between the start and end, and ADDR must be page-aligned (LEN will
+   be page-aligned implicitly).  */
+int mseal (void *__addr, size_t __len, unsigned long flags) __THROW;
 
 __END_DECLS
 

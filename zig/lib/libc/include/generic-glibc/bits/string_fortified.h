@@ -1,4 +1,4 @@
-/* Copyright (C) 2004-2025 Free Software Foundation, Inc.
+/* Copyright (C) 2004-2026 Free Software Foundation, Inc.
    This file is part of the GNU C Library.
 
    The GNU C Library is free software; you can redistribute it and/or
@@ -59,6 +59,18 @@ __NTH (memset (void *__dest, int __ch, size_t __len))
   return __builtin___memset_chk (__dest, __ch, __len,
 				 __glibc_objsize0 (__dest));
 }
+
+#if defined __USE_MISC || __GLIBC_USE (ISOC23)
+void *__memset_explicit_chk (void *__s, int __c, size_t __n, size_t __destlen)
+     __THROW __nonnull ((1)) __fortified_attr_access (__write_only__, 1, 3);
+
+__fortify_function void *
+__NTH (memset_explicit (void *__dest, int __ch, size_t __len))
+{
+  return __memset_explicit_chk (__dest, __ch, __len,
+				__glibc_objsize0 (__dest));
+}
+#endif
 
 #ifdef __USE_MISC
 # include <bits/strings_fortified.h>

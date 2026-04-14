@@ -1,7 +1,9 @@
 #target=x86_64-linux-selfhosted
-#target=x86_64-windows-selfhosted
+//#target=x86_64-windows-selfhosted
 #target=x86_64-linux-cbe
 #target=x86_64-windows-cbe
+#target=x86_64-linux-llvm
+//#target=wasm32-wasi-selfhosted
 #update=initial version
 #file=main.zig
 pub fn main() !u8 {
@@ -17,7 +19,7 @@ fn myPanic(msg: []const u8, _: ?usize) noreturn {
     std.process.exit(0);
 }
 const std = @import("std");
-const io = std.Io.Threaded.global_single_threaded.ioBasic();
+const io = std.Io.Threaded.global_single_threaded.io();
 #expect_stdout="panic message: integer overflow\n"
 
 #update=change the panic handler body
@@ -35,7 +37,7 @@ fn myPanic(msg: []const u8, _: ?usize) noreturn {
     std.process.exit(0);
 }
 const std = @import("std");
-const io = std.Io.Threaded.global_single_threaded.ioBasic();
+const io = std.Io.Threaded.global_single_threaded.io();
 #expect_stdout="new panic message: integer overflow\n"
 
 #update=change the panic handler function value
@@ -53,5 +55,5 @@ fn myPanicNew(msg: []const u8, _: ?usize) noreturn {
     std.process.exit(0);
 }
 const std = @import("std");
-const io = std.Io.Threaded.global_single_threaded.ioBasic();
+const io = std.Io.Threaded.global_single_threaded.io();
 #expect_stdout="third panic message: integer overflow\n"

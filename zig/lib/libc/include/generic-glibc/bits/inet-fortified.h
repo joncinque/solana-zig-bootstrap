@@ -1,5 +1,5 @@
 /* Checking macros for inet functions.
-   Copyright (C) 2025 Free Software Foundation, Inc.
+   Copyright (C) 2025-2026 Free Software Foundation, Inc.
    This file is part of the GNU C Library.
 
    The GNU C Library is free software; you can redistribute it and/or
@@ -45,15 +45,17 @@ __NTH (inet_pton (int __af,
     __fortify_clang_warning_only_if_bos0_lt
 	(4, __dst, "inet_pton called with destination buffer size less than 4")
 {
-  size_t sz = 0;
+#if !__fortify_use_clang
+  size_t __sz = 0;
   if (__af == AF_INET)
-    sz = sizeof (struct in_addr);
+    __sz = sizeof (struct in_addr);
   else if (__af == AF_INET6)
-    sz = sizeof (struct in6_addr);
+    __sz = sizeof (struct in6_addr);
   else
     return __inet_pton_alias (__af, __src, __dst);
+#endif
 
-  return __glibc_fortify (inet_pton, sz, sizeof (char),
+  return __glibc_fortify (inet_pton, __sz, sizeof (char),
 			  __glibc_objsize (__dst),
 			  __af, __src, __dst);
 };

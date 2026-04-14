@@ -1,10 +1,13 @@
 const Manifest = @This();
+
 const std = @import("std");
+const Io = std.Io;
 const mem = std.mem;
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 const Ast = std.zig.Ast;
 const testing = std.testing;
+
 const Package = @import("../Package.zig");
 
 pub const max_bytes = 10 * 1024 * 1024;
@@ -49,15 +52,11 @@ arena_state: std.heap.ArenaAllocator.State,
 
 pub const ParseOptions = struct {
     allow_missing_paths_field: bool = false,
-    /// Deprecated, to be removed after 0.14.0 is tagged.
-    allow_name_string: bool = true,
-    /// Deprecated, to be removed after 0.14.0 is tagged.
-    allow_missing_fingerprint: bool = true,
 };
 
 pub const Error = Allocator.Error;
 
-pub fn parse(gpa: Allocator, ast: Ast, rng: std.Random, options: ParseOptions) Error!Manifest {
+pub fn parse(gpa: Allocator, ast: *const Ast, rng: std.Random, options: ParseOptions) Error!Manifest {
     const main_node_index = ast.nodeData(.root).node;
 
     var arena_instance = std.heap.ArenaAllocator.init(gpa);
@@ -65,9 +64,9 @@ pub fn parse(gpa: Allocator, ast: Ast, rng: std.Random, options: ParseOptions) E
 
     var p: Parse = .{
         .gpa = gpa,
-        .ast = ast,
+        .ast = ast.*,
         .arena = arena_instance.allocator(),
-        .errors = .{},
+        .errors = .empty,
 
         .name = undefined,
         .id = 0,
@@ -75,12 +74,10 @@ pub fn parse(gpa: Allocator, ast: Ast, rng: std.Random, options: ParseOptions) E
         .version_node = undefined,
         .dependencies = .{},
         .dependencies_node = .none,
-        .paths = .{},
+        .paths = .empty,
         .allow_missing_paths_field = options.allow_missing_paths_field,
-        .allow_name_string = options.allow_name_string,
-        .allow_missing_fingerprint = options.allow_missing_fingerprint,
         .minimum_zig_version = null,
-        .buf = .{},
+        .buf = .empty,
     };
     defer p.buf.deinit(gpa);
     defer p.errors.deinit(gpa);
@@ -151,8 +148,6 @@ const Parse = struct {
     dependencies_node: Ast.Node.OptionalIndex,
     paths: std.StringArrayHashMapUnmanaged(void),
     allow_missing_paths_field: bool,
-    allow_name_string: bool,
-    allow_missing_fingerprint: bool,
     minimum_zig_version: ?std.SemanticVersion,
 
     const InnerError = error{ ParseFailure, OutOfMemory };
@@ -221,12 +216,10 @@ const Parse = struct {
                     });
                 }
                 p.id = n.id;
-            } else if (!p.allow_missing_fingerprint) {
+            } else {
                 try appendError(p, main_token, "missing top-level 'fingerprint' field; suggested value: 0x{x}", .{
                     Package.Fingerprint.generate(rng, p.name).int(),
                 });
-            } else {
-                p.id = 0;
             }
         }
 
@@ -395,19 +388,6 @@ const Parse = struct {
         const ast = p.ast;
         const main_token = ast.nodeMainToken(node);
 
-        if (p.allow_name_string and ast.nodeTag(node) == .string_literal) {
-            const name = try parseString(p, node);
-            if (!std.zig.isValidId(name))
-                return fail(p, main_token, "name must be a valid bare zig identifier (hint: switch from string to enum literal)", .{});
-
-            if (name.len > max_name_len)
-                return fail(p, main_token, "name '{f}' exceeds max length of {d}", .{
-                    std.zig.fmtId(name), max_name_len,
-                });
-
-            return name;
-        }
-
         if (ast.nodeTag(node) != .enum_literal)
             return fail(p, main_token, "expected enum literal", .{});
 
@@ -440,12 +420,10 @@ const Parse = struct {
         const ast = p.ast;
         const tok = ast.nodeMainToken(node);
         const h = try parseString(p, node);
-
-        if (h.len > Package.Hash.max_len) {
-            return fail(p, tok, "hash length exceeds maximum: {d}", .{h.len});
+        switch (Package.Hash.validate(h)) {
+            .ok => return h,
+            else => |t| return fail(p, tok, "invalid hash: {t}", .{t}),
         }
-
-        return h;
     }
 
     /// TODO: try to DRY this with AstGen.identifierTokenString
@@ -601,18 +579,58 @@ const Parse = struct {
     }
 };
 
+pub fn load(
+    io: Io,
+    arena: Allocator,
+    manifest_path: std.Build.Cache.Path,
+    ast: *std.zig.Ast,
+    error_bundle: *std.zig.ErrorBundle.Wip,
+    manifest: *Manifest,
+    allow_missing_paths_field: bool,
+) !void {
+    const manifest_bytes = try manifest_path.root_dir.handle.readFileAllocOptions(
+        io,
+        manifest_path.sub_path,
+        arena,
+        .limited(max_bytes),
+        .@"1",
+        0,
+    );
+
+    ast.* = try std.zig.Ast.parse(arena, manifest_bytes, .zon);
+
+    if (ast.errors.len > 0) {
+        const file_path = try manifest_path.joinString(arena, "");
+        try std.zig.putAstErrorsIntoBundle(arena, ast.*, file_path, error_bundle);
+        return error.ErrorsBundled;
+    }
+
+    const rng: std.Random.IoSource = .{ .io = io };
+
+    manifest.* = try parse(arena, ast, rng.interface(), .{
+        .allow_missing_paths_field = allow_missing_paths_field,
+    });
+
+    if (manifest.errors.len > 0) {
+        const src_path = try error_bundle.printString("{f}", .{manifest_path});
+        try manifest.copyErrorsIntoBundle(ast.*, src_path, error_bundle);
+        return error.ErrorsBundled;
+    }
+}
+
 test "basic" {
     const gpa = testing.allocator;
 
     const example =
         \\.{
-        \\    .name = "foo",
+        \\    .name = .foo,
+        \\    .fingerprint = 0x8c736521490b23df,
         \\    .version = "3.2.1",
         \\    .paths = .{""},
         \\    .dependencies = .{
         \\        .bar = .{
         \\            .url = "https://example.com/baz.tar.gz",
-        \\            .hash = "1220f1b680b6065fcfc94fe777f22e73bcb7e2767e5f4d99d4255fe76ded69c7a35f",
+        \\            .hash = "libmp3lame-3.100.1-6-67wlF_KvEwDRCT3pTpcDzi5KGntWCEoM-WtvVPEWdlk5",
         \\        },
         \\    },
         \\}
@@ -625,7 +643,7 @@ test "basic" {
 
     var rng = std.Random.DefaultPrng.init(0);
 
-    var manifest = try Manifest.parse(gpa, ast, rng.random(), .{});
+    var manifest = try Manifest.parse(gpa, &ast, rng.random(), .{});
     defer manifest.deinit(gpa);
 
     try testing.expect(manifest.errors.len == 0);
@@ -644,7 +662,7 @@ test "basic" {
         manifest.dependencies.values()[0].location.url,
     );
     try testing.expectEqualStrings(
-        "1220f1b680b6065fcfc94fe777f22e73bcb7e2767e5f4d99d4255fe76ded69c7a35f",
+        "libmp3lame-3.100.1-6-67wlF_KvEwDRCT3pTpcDzi5KGntWCEoM-WtvVPEWdlk5",
         manifest.dependencies.values()[0].hash orelse return error.TestFailed,
     );
 
@@ -656,7 +674,8 @@ test "minimum_zig_version" {
 
     const example =
         \\.{
-        \\    .name = "foo",
+        \\    .name = .foo,
+        \\    .fingerprint = 0x8c736521490b23df,
         \\    .version = "3.2.1",
         \\    .paths = .{""},
         \\    .minimum_zig_version = "0.11.1",
@@ -670,7 +689,7 @@ test "minimum_zig_version" {
 
     var rng = std.Random.DefaultPrng.init(0);
 
-    var manifest = try Manifest.parse(gpa, ast, rng.random(), .{});
+    var manifest = try Manifest.parse(gpa, &ast, rng.random(), .{});
     defer manifest.deinit(gpa);
 
     try testing.expect(manifest.errors.len == 0);
@@ -690,7 +709,8 @@ test "minimum_zig_version - invalid version" {
 
     const example =
         \\.{
-        \\    .name = "foo",
+        \\    .name = .foo,
+        \\    .fingerprint = 0x8c736521490b23df,
         \\    .version = "3.2.1",
         \\    .minimum_zig_version = "X.11.1",
         \\    .paths = .{""},
@@ -704,7 +724,7 @@ test "minimum_zig_version - invalid version" {
 
     var rng = std.Random.DefaultPrng.init(0);
 
-    var manifest = try Manifest.parse(gpa, ast, rng.random(), .{});
+    var manifest = try Manifest.parse(gpa, &ast, rng.random(), .{});
     defer manifest.deinit(gpa);
 
     try testing.expect(manifest.errors.len == 1);

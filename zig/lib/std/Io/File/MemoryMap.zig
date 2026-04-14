@@ -74,6 +74,9 @@ pub fn destroy(mm: *MemoryMap, io: Io) void {
 }
 
 pub const SetLengthError = error{
+    /// Changing the mapping length could not be done atomically. Caller must
+    /// use `destroy` and `create` to resize the mapping.
+    OperationUnsupported,
     /// One of the following:
     /// * The `File.Kind` is not `file`.
     /// * The file is not open for reading and read access protections enabled.
@@ -91,17 +94,8 @@ pub const SetLengthError = error{
 /// of the file after calling this is unspecified until `write` is called.
 ///
 /// May change the pointer address of `memory`.
-///
-/// `options` is needed because the mapping may need to be destroyed and
-/// re-created. All the same options must be provided except for `len` which is
-/// the new length.
-///
-/// This operation cannot be completed atomically on all operating systems.
-/// When this function fails, the `MemoryMap` may be left in an unmapped state,
-/// which can be detected by checking if `memory.len` is zero. In such case it
-/// is safe to call `destroy` which will have no effect.
-pub fn setLength(mm: *MemoryMap, io: Io, options: CreateOptions) SetLengthError!void {
-    return io.vtable.fileMemoryMapSetLength(io.userdata, mm, options);
+pub fn setLength(mm: *MemoryMap, io: Io, new_len: usize) SetLengthError!void {
+    return io.vtable.fileMemoryMapSetLength(io.userdata, mm, new_len);
 }
 
 /// Synchronizes the contents of `memory` from `file`.

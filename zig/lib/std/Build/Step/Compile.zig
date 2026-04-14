@@ -79,6 +79,10 @@ rc_includes: std.zig.RcIncludes = .any,
 /// Set via options; intended to be read-only after that.
 win32_manifest: ?LazyPath = null,
 
+/// (Windows) .def file to embed in the compilation (dll)
+/// Set via options; intended to be read-only after that.
+win32_module_definition: ?LazyPath = null,
+
 installed_path: ?[]const u8,
 
 /// Base address for an executable image.
@@ -215,6 +219,8 @@ generated_docs: ?*GeneratedFile,
 generated_asm: ?*GeneratedFile,
 generated_bin: ?*GeneratedFile,
 generated_pdb: ?*GeneratedFile,
+// hack for stage2_x86_64 + coff
+generated_compiler_rt_dyn_lib: ?*GeneratedFile,
 generated_implib: ?*GeneratedFile,
 generated_llvm_bc: ?*GeneratedFile,
 generated_llvm_ir: ?*GeneratedFile,
@@ -284,6 +290,8 @@ pub const Options = struct {
     /// Can be set regardless of target. The `.manifest` file will be ignored
     /// if the target object format does not support embedded manifests.
     win32_manifest: ?LazyPath = null,
+    /// Win32 module definition file.
+    win32_module_definition: ?LazyPath = null,
 };
 
 pub const Kind = enum {
@@ -435,6 +443,7 @@ pub fn create(owner: *std.Build, options: Options) *Compile {
         .generated_asm = null,
         .generated_bin = null,
         .generated_pdb = null,
+        .generated_compiler_rt_dyn_lib = null,
         .generated_implib = null,
         .generated_llvm_bc = null,
         .generated_llvm_ir = null,
@@ -466,6 +475,13 @@ pub fn create(owner: *std.Build, options: Options) *Compile {
         if (options.win32_manifest) |lp| {
             compile.win32_manifest = lp.dupe(compile.step.owner);
             lp.addStepDependencies(&compile.step);
+        }
+        if (compile.kind == .lib and compile.linkage != null and compile.linkage.? == .dynamic) {
+            // Building a Win32 DLL, check for win32 .def file.
+            if (options.win32_module_definition) |lp| {
+                compile.win32_module_definition = lp.dupe(compile.step.owner);
+                lp.addStepDependencies(&compile.step);
+            }
         }
     }
 
@@ -637,11 +653,11 @@ pub fn dependsOnSystemLibrary(compile: *Compile, name: []const u8) bool {
 
     const target = compile.rootModuleTarget();
 
-    if (std.zig.target.isLibCLibName(target, name)) {
+    if (std.zig.target.isLibCLibName(&target, name)) {
         return is_linking_libc;
     }
 
-    if (std.zig.target.isLibCxxLibName(target, name)) {
+    if (std.zig.target.isLibCxxLibName(&target, name)) {
         return is_linking_libcpp;
     }
 
@@ -678,6 +694,13 @@ pub fn producesPdbFile(compile: *Compile) bool {
     return compile.isDynamicLibrary() or compile.kind == .exe or compile.kind == .@"test";
 }
 
+pub fn producesCompilerRtDynLib(compile: *Compile) bool {
+    if (compile.rootModuleTarget().ofmt != .coff) return false;
+    if (compile.bundle_compiler_rt orelse (compile.kind == .exe or compile.isDynamicLibrary()))
+        return compile.use_llvm == false;
+    return false;
+}
+
 pub fn producesImplib(compile: *Compile) bool {
     return compile.isDll();
 }
@@ -689,10 +712,10 @@ const PkgConfigResult = struct {
 
 /// Run pkg-config for the given library name and parse the output, returning the arguments
 /// that should be passed to zig to link the given library.
-fn runPkgConfig(compile: *Compile, lib_name: []const u8) !PkgConfigResult {
+pub fn runPkgConfig(step: *Step, lib_name: []const u8) !PkgConfigResult {
     const wl_rpath_prefix = "-Wl,-rpath,";
 
-    const b = compile.step.owner;
+    const b = step.owner;
     const pkg_name = match: {
         // First we have to map the library name to pkg config name. Unfortunately,
         // there are several examples where this is not straightforward:
@@ -785,7 +808,7 @@ fn runPkgConfig(compile: *Compile, lib_name: []const u8) !PkgConfigResult {
         } else if (mem.startsWith(u8, arg, wl_rpath_prefix)) {
             try zig_cflags.appendSlice(&[_][]const u8{ "-rpath", arg[wl_rpath_prefix.len..] });
         } else if (b.debug_pkg_config) {
-            return compile.step.fail("unknown pkg-config flag '{s}'", .{arg});
+            return step.fail("unknown pkg-config flag '{s}'", .{arg});
         }
     }
 
@@ -854,6 +877,12 @@ pub fn getEmittedH(compile: *Compile) LazyPath {
 pub fn getEmittedPdb(compile: *Compile) LazyPath {
     _ = compile.getEmittedBin();
     return compile.getEmittedFileGeneric(&compile.generated_pdb);
+}
+
+/// Returns the generated compiler_rt dynamic library.
+/// This is a hack for stage2_x86_64 + coff.
+pub fn getEmittedCompilerRtDynLib(compile: *Compile) ?LazyPath {
+    return compile.getEmittedFileGeneric(&compile.generated_compiler_rt_dyn_lib);
 }
 
 /// Returns the path to the generated documentation directory.
@@ -1098,7 +1127,7 @@ fn getZigArgs(compile: *Compile, fuzz: bool) ![][]const u8 {
                             switch (system_lib.use_pkg_config) {
                                 .no => try zig_args.append(b.fmt("{s}{s}", .{ prefix, system_lib.name })),
                                 .yes, .force => {
-                                    if (compile.runPkgConfig(system_lib.name)) |result| {
+                                    if (runPkgConfig(&compile.step, system_lib.name)) |result| {
                                         try zig_args.appendSlice(result.cflags);
                                         try zig_args.appendSlice(result.libs);
                                         try seen_system_libs.put(arena, system_lib.name, result.cflags);
@@ -1332,6 +1361,10 @@ fn getZigArgs(compile: *Compile, fuzz: bool) ![][]const u8 {
         try zig_args.append(manifest_file.getPath2(b, step));
     }
 
+    if (compile.win32_module_definition) |module_file| {
+        try zig_args.append(module_file.getPath2(b, step));
+    }
+
     if (compile.image_base) |image_base| {
         try zig_args.append("--image-base");
         try zig_args.append(b.fmt("0x{x}", .{image_base}));
@@ -1445,7 +1478,8 @@ fn getZigArgs(compile: *Compile, fuzz: bool) ![][]const u8 {
     try zig_args.append("--global-cache-dir");
     try zig_args.append(b.graph.global_cache_root.path orelse ".");
 
-    if (b.graph.debug_compiler_runtime_libs) try zig_args.append("--debug-rt");
+    if (b.graph.debug_compiler_runtime_libs) |mode|
+        try zig_args.append(b.fmt("--debug-rt={t}", .{mode}));
 
     try zig_args.append("--name");
     try zig_args.append(compile.name);
@@ -1776,6 +1810,8 @@ fn make(step: *Step, options: Step.MakeOptions) !void {
         // zig fmt: off
         if (compile.generated_bin)     |lp| lp.path = compile.outputPath(output_dir, .bin);
         if (compile.generated_pdb)     |lp| lp.path = compile.outputPath(output_dir, .pdb);
+        // hack for stage2_x86_64 + coff
+        if (compile.generated_compiler_rt_dyn_lib) |lp| lp.path = compile.outputPath(output_dir, .compiler_rt_dyn_lib);
         if (compile.generated_implib)  |lp| lp.path = compile.outputPath(output_dir, .implib);
         if (compile.generated_h)       |lp| lp.path = compile.outputPath(output_dir, .h);
         if (compile.generated_docs)    |lp| lp.path = compile.outputPath(output_dir, .docs);
@@ -1786,7 +1822,8 @@ fn make(step: *Step, options: Step.MakeOptions) !void {
     }
 
     if (compile.kind == .lib and compile.linkage != null and compile.linkage.? == .dynamic and
-        compile.version != null and std.Build.wantSharedLibSymLinks(compile.rootModuleTarget()))
+        compile.version != null and compile.generated_bin != null and
+        std.Build.wantSharedLibSymLinks(compile.rootModuleTarget()))
     {
         try doAtomicSymLinks(
             step,

@@ -260,12 +260,14 @@ pub fn resolveTargetQuery(io: Io, query: Target.Query) DetectError!Target {
                 var value: u32 = undefined;
                 var len: usize = @sizeOf(@TypeOf(value));
 
-                posix.sysctlbynameZ(key, &value, &len, null, 0) catch |err| switch (err) {
-                    error.PermissionDenied => unreachable, // only when setting values,
-                    error.SystemResources => unreachable, // memory already on the stack
-                    error.UnknownName => unreachable, // constant, known good value
-                    error.Unexpected => return error.OSVersionDetectionFail,
-                };
+                switch (posix.errno(posix.system.sysctlbyname(key, &value, &len, null, 0))) {
+                    .SUCCESS => {},
+                    .FAULT => unreachable,
+                    .PERM => unreachable, // only when setting values,
+                    .NOMEM => unreachable, // memory already on the stack
+                    .NOENT => unreachable, // constant, known good value
+                    else => return error.OSVersionDetectionFail,
+                }
 
                 switch (builtin.target.os.tag) {
                     .freebsd => {
@@ -418,10 +420,10 @@ pub fn resolveTargetQuery(io: Io, query: Target.Query) DetectError!Target {
         error.Canceled => |e| return e,
         error.Unexpected => |e| return e,
         error.WouldBlock => return error.Unexpected,
-        error.BrokenPipe => return error.Unexpected,
         error.ConnectionResetByPeer => return error.Unexpected,
         error.NotOpenForReading => return error.Unexpected,
         error.SocketUnconnected => return error.Unexpected,
+        error.ReadOnlyFileSystem => return error.Unexpected,
 
         error.AccessDenied,
         error.SymLinkLoop,
@@ -504,7 +506,6 @@ pub fn resolveTargetQuery(io: Io, query: Target.Query) DetectError!Target {
     if (builtin.os.tag == .linux and result.isBionicLibC() and query.os_tag == null and query.android_api_level == null) {
         result.os.version_range.linux.android = detectAndroidApiLevel(io) catch |err| return switch (err) {
             error.InvalidWtf8,
-            error.CurrentWorkingDirectoryUnlinked,
             error.InvalidBatchScriptArg,
             => unreachable, // Windows-only
             error.ApiLevelQueryFailed => |e| e,
@@ -724,6 +725,7 @@ fn abiAndDynamicLinkerFromFile(
                 error.UnsupportedReparsePointType => unreachable, // Windows only
                 error.NetworkNotFound => unreachable, // Windows only
                 error.AntivirusInterference => unreachable, // Windows only
+                error.FileBusy => unreachable, // Windows only
 
                 error.AccessDenied,
                 error.PermissionDenied,
@@ -845,7 +847,6 @@ fn glibcVerFromRPath(io: Io, rpath: []const u8) !std.SemanticVersion {
         error.NameTooLong => return error.Unexpected,
         error.BadPathName => return error.Unexpected,
         error.PipeBusy => return error.Unexpected, // Windows-only
-        error.SharingViolation => return error.Unexpected, // Windows-only
         error.NetworkNotFound => return error.Unexpected, // Windows-only
         error.AntivirusInterference => return error.Unexpected, // Windows-only
         error.FileLocksUnsupported => return error.Unexpected, // No lock requested.
@@ -853,6 +854,7 @@ fn glibcVerFromRPath(io: Io, rpath: []const u8) !std.SemanticVersion {
         error.PathAlreadyExists => return error.Unexpected, // read-only
         error.DeviceBusy => return error.Unexpected, // read-only
         error.FileBusy => return error.Unexpected, // read-only
+        error.ReadOnlyFileSystem => return error.Unexpected, // read-only
         error.NoDevice => return error.Unexpected, // not asking for a special device
         error.FileTooBig => return error.Unexpected,
         error.WouldBlock => return error.Unexpected, // not opened in non-blocking
@@ -1053,7 +1055,6 @@ fn detectAbiAndDynamicLinker(io: Io, cpu: Target.Cpu, os: Target.Os, query: Targ
                 error.NoSpaceLeft => return error.Unexpected,
                 error.NameTooLong => return error.Unexpected,
                 error.PathAlreadyExists => return error.Unexpected,
-                error.SharingViolation => return error.Unexpected,
                 error.BadPathName => return error.Unexpected,
                 error.PipeBusy => return error.Unexpected,
                 error.FileLocksUnsupported => return error.Unexpected,
@@ -1184,11 +1185,25 @@ fn detectAndroidApiLevel(io: Io) !u32 {
         return error.ApiLevelQueryFailed;
     };
 
-    const term = try child.wait(io);
-    if (term != .exited or term.exited != 0) {
-        std.log.err("getprop terminated abnormally: {}", .{term});
-        return error.ApiLevelQueryFailed;
+    switch (try child.wait(io)) {
+        .exited => |code| if (code != 0) {
+            std.log.err("getprop terminated abnormally with exit code: {d}", .{code});
+            return error.ApiLevelQueryFailed;
+        },
+        .signal => |sig| {
+            std.log.err("getprop terminated abnormally with signal: {t}", .{sig});
+            return error.ApiLevelQueryFailed;
+        },
+        .stopped => |sig| {
+            std.log.err("getprop stopped abnormally with signal: {t}", .{sig});
+            return error.ApiLevelQueryFailed;
+        },
+        .unknown => {
+            std.log.err("getprop terminated abnormally", .{});
+            return error.ApiLevelQueryFailed;
+        },
     }
+
     return api_level;
 }
 

@@ -151,6 +151,14 @@
 #define zig_has_attribute(attribute) 0
 #endif
 
+#if __STDC_VERSION__ >= 201112L
+#define zig_static_assert(cond, msg) _Static_assert(cond, msg)
+#elif zig_has_attribute(unused)
+#define zig_static_assert(cond, _) typedef char zig_expand_concat(zig_static_assert_fail_, __LINE__)[!!(cond)] __attribute__((unused))
+#else
+#define zig_static_assert(cond, _) typedef char zig_expand_concat(zig_static_assert_fail_, __LINE__)[!!(cond)]
+#endif
+
 #if __STDC_VERSION__ >= 202311L
 #define zig_threadlocal thread_local
 #elif __STDC_VERSION__ >= 201112L
@@ -259,7 +267,7 @@
 #endif
 
 #if zig_has_attribute(packed) || defined(zig_tinyc)
-#define zig_packed(definition) __attribute__((packed)) definition
+#define zig_packed(definition) definition __attribute__((packed))
 #elif defined(zig_msvc)
 #define zig_packed(definition) __pragma(pack(1)) definition __pragma(pack())
 #else
@@ -1972,6 +1980,20 @@ static inline zig_u128 zig_bit_reverse_u128(zig_u128 val, uint8_t bits) {
 static inline zig_i128 zig_bit_reverse_i128(zig_i128 val, uint8_t bits) {
     return zig_bitCast_i128(zig_bit_reverse_u128(zig_bitCast_u128(val), bits));
 }
+
+#if zig_has_int128
+#define zig_switch_int128(operand) switch (operand)
+#define zig_switch_prong_begin_int128()
+#define zig_switch_case_int128(Type, operand, value) case value:
+#define zig_switch_prong_end_int128()
+#define zig_switch_default_int128() default:
+#else // zig_has_int128
+#define zig_switch_int128(operand)
+#define zig_switch_prong_begin_int128() if (0
+#define zig_switch_case_int128(Type, operand, value) || (zig_cmp_##Type(operand, value) == 0)
+#define zig_switch_prong_end_int128() )
+#define zig_switch_default_int128()
+#endif // zig_has_int128
 
 /* ========================== Big Integer Support =========================== */
 
@@ -4148,7 +4170,7 @@ static inline void zig_msvc_atomic_store_i128(zig_i128 volatile* obj, zig_i128 a
 
 #if defined(zig_thumb)
 
-static inline void* zig_thumb_windows_teb(void) {
+static inline void* zig_windows_teb(void) {
     void* teb = 0;
 #if defined(zig_msvc)
     teb = (void*)_MoveFromCoprocessor(15, 0, 13, 0, 2);
@@ -4160,7 +4182,7 @@ static inline void* zig_thumb_windows_teb(void) {
 
 #elif defined(zig_aarch64)
 
-static inline void* zig_aarch64_windows_teb(void) {
+static inline void* zig_windows_teb(void) {
     void* teb = 0;
 #if defined(zig_msvc)
     teb = (void*)__readx18qword(0x0);
@@ -4172,7 +4194,7 @@ static inline void* zig_aarch64_windows_teb(void) {
 
 #elif defined(zig_x86_32)
 
-static inline void* zig_x86_windows_teb(void) {
+static inline void* zig_windows_teb(void) {
     void* teb = 0;
 #if defined(zig_msvc)
     teb = (void*)__readfsdword(0x18);
@@ -4182,9 +4204,19 @@ static inline void* zig_x86_windows_teb(void) {
     return teb;
 }
 
+static inline void* zig_windows_peb(void) {
+    void* peb = 0;
+#if defined(zig_msvc)
+    peb = (void*)__readfsdword(0x30);
+#elif defined(zig_gnuc_asm)
+    __asm__ ("movl %%fs:0x30, %[ptr]" : [ptr] "=r" (peb));
+#endif
+    return peb;
+}
+
 #elif defined(zig_x86_64)
 
-static inline void* zig_x86_64_windows_teb(void) {
+static inline void* zig_windows_teb(void) {
     void* teb = 0;
 #if defined(zig_msvc)
     teb = (void*)__readgsqword(0x30);
@@ -4192,6 +4224,16 @@ static inline void* zig_x86_64_windows_teb(void) {
     __asm__ ("movq %%gs:0x30, %[ptr]" : [ptr] "=r" (teb));
 #endif
     return teb;
+}
+
+static inline void* zig_windows_peb(void) {
+    void* peb = 0;
+#if defined(zig_msvc)
+    peb = (void*)__readgsqword(0x60);
+#elif defined(zig_gnuc_asm)
+    __asm__ ("movq %%gs:0x60, %[ptr]" : [ptr] "=r" (peb));
+#endif
+    return peb;
 }
 
 #endif

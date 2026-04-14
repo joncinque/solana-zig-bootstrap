@@ -1,4 +1,4 @@
-#ifdef __longarch_soft_float
+#ifdef __loongarch_soft_float
 #define FE_ALL_EXCEPT 0
 #define FE_TONEAREST  0
 #else

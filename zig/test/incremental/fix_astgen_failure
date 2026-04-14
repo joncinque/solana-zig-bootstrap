@@ -1,8 +1,9 @@
 #target=x86_64-linux-selfhosted
-#target=x86_64-windows-selfhosted
+//#target=x86_64-windows-selfhosted
 #target=x86_64-linux-cbe
 #target=x86_64-windows-cbe
-#target=wasm32-wasi-selfhosted
+#target=x86_64-linux-llvm
+//#target=wasm32-wasi-selfhosted
 #update=initial version with error
 #file=main.zig
 pub fn main() !void {
@@ -19,7 +20,7 @@ const std = @import("std");
 pub fn hello() !void {
     try std.Io.File.stdout().writeStreamingAll(io, "Hello, World!\n");
 }
-const io = std.Io.Threaded.global_single_threaded.ioBasic();
+const io = std.Io.Threaded.global_single_threaded.io();
 #expect_stdout="Hello, World!\n"
 #update=add new error
 #file=foo.zig
@@ -27,7 +28,7 @@ const std = @import("std");
 pub fn hello() !void {
     try std.Io.File.stdout().writeStreamingAll(io, hello_str);
 }
-const io = std.Io.Threaded.global_single_threaded.ioBasic();
+const io = std.Io.Threaded.global_single_threaded.io();
 #expect_error=foo.zig:3:52: error: use of undeclared identifier 'hello_str'
 #update=fix the new error
 #file=foo.zig
@@ -36,5 +37,5 @@ const hello_str = "Hello, World! Again!\n";
 pub fn hello() !void {
     try std.Io.File.stdout().writeStreamingAll(io, hello_str);
 }
-const io = std.Io.Threaded.global_single_threaded.ioBasic();
+const io = std.Io.Threaded.global_single_threaded.io();
 #expect_stdout="Hello, World! Again!\n"

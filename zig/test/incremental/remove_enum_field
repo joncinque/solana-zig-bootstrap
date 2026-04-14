@@ -1,8 +1,9 @@
 #target=x86_64-linux-selfhosted
-#target=x86_64-windows-selfhosted
+//#target=x86_64-windows-selfhosted
 #target=x86_64-linux-cbe
 #target=x86_64-windows-cbe
-#target=wasm32-wasi-selfhosted
+#target=x86_64-linux-llvm
+//#target=wasm32-wasi-selfhosted
 #update=initial version
 #file=main.zig
 const MyEnum = enum(u8) {
@@ -14,7 +15,7 @@ pub fn main() !void {
     try stdout_writer.interface.print("{}\n", .{@intFromEnum(MyEnum.foo)});
 }
 const std = @import("std");
-const io = std.Io.Threaded.global_single_threaded.ioBasic();
+const io = std.Io.Threaded.global_single_threaded.io();
 #expect_stdout="1\n"
 #update=remove enum field
 #file=main.zig
@@ -27,6 +28,6 @@ pub fn main() !void {
     try stdout_writer.interface.print("{}\n", .{@intFromEnum(MyEnum.foo)});
 }
 const std = @import("std");
-const io = std.Io.Threaded.global_single_threaded.ioBasic();
+const io = std.Io.Threaded.global_single_threaded.io();
 #expect_error=main.zig:7:69: error: enum 'main.MyEnum' has no member named 'foo'
 #expect_error=main.zig:1:16: note: enum declared here

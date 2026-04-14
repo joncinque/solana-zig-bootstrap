@@ -20,8 +20,10 @@ const der = Certificate.der;
 const base64 = std.base64.standard.decoderWithIgnore(" \t\r\n");
 
 /// The key is the contents slice of the subject.
-map: std.HashMapUnmanaged(der.Element.Slice, u32, MapContext, std.hash_map.default_max_load_percentage) = .empty,
-bytes: std.ArrayList(u8) = .empty,
+map: std.HashMapUnmanaged(der.Element.Slice, u32, MapContext, std.hash_map.default_max_load_percentage),
+bytes: std.ArrayList(u8),
+
+pub const empty: Bundle = .{ .map = .empty, .bytes = .empty };
 
 pub const VerifyError = Certificate.Parsed.VerifyError || error{
     CertificateIssuerNotFound,
@@ -153,11 +155,11 @@ fn rescanWindows(cb: *Bundle, gpa: Allocator, io: Io, now: Io.Timestamp) RescanW
     const w = std.os.windows;
     const GetLastError = w.GetLastError;
     const root = [4:0]u16{ 'R', 'O', 'O', 'T' };
-    const store = w.crypt32.CertOpenSystemStoreW(null, &root) orelse switch (GetLastError()) {
+    const store = w.crypt32.CertOpenSystemStoreW(.NULL, &root) orelse switch (GetLastError()) {
         .FILE_NOT_FOUND => return error.FileNotFound,
         else => |err| return w.unexpectedError(err),
     };
-    defer _ = w.crypt32.CertCloseStore(store, 0);
+    defer assert(w.crypt32.CertCloseStore(store, .{ .CHECK = std.debug.runtime_safety }).toBool());
 
     const now_sec = now.toSeconds();
 
@@ -182,7 +184,8 @@ pub fn addCertsFromDirPath(
 ) AddCertsFromDirPathError!void {
     var iterable_dir = try dir.openDir(io, sub_dir_path, .{ .iterate = true });
     defer iterable_dir.close(io);
-    return addCertsFromDir(cb, gpa, io, iterable_dir);
+    const now = Io.Clock.real.now(io);
+    return addCertsFromDir(cb, gpa, io, now, iterable_dir);
 }
 
 pub fn addCertsFromDirPathAbsolute(
@@ -212,7 +215,7 @@ pub fn addCertsFromDir(cb: *Bundle, gpa: Allocator, io: Io, now: Io.Timestamp, i
     }
 }
 
-pub const AddCertsFromFilePathError = Io.File.OpenError || AddCertsFromFileError || Io.Clock.Error;
+pub const AddCertsFromFilePathError = Io.File.OpenError || AddCertsFromFileError;
 
 pub fn addCertsFromFilePathAbsolute(
     cb: *Bundle,
@@ -329,16 +332,29 @@ const MapContext = struct {
     }
 };
 
+test "addCertsFromDirPath compiles and accepts an empty directory" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var bundle: Bundle = .empty;
+    defer bundle.deinit(gpa);
+
+    try bundle.addCertsFromDirPath(gpa, io, tmp.dir, ".");
+}
+
 test "scan for OS-provided certificates" {
     if (builtin.os.tag == .wasi) return error.SkipZigTest;
 
     const io = std.testing.io;
     const gpa = std.testing.allocator;
 
-    var bundle: Bundle = .{};
+    var bundle: Bundle = .empty;
     defer bundle.deinit(gpa);
 
-    const now = try Io.Clock.real.now(io);
+    const now = Io.Clock.real.now(io);
 
     try bundle.rescan(gpa, io, now);
 }

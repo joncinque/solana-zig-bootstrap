@@ -205,181 +205,6 @@ set(ZIG_CPP_SOURCES
 set(ZIG_STAGE2_SOURCES
     "${ZIG_CONFIG_ZIG_OUT}"
     lib/compiler_rt.zig
-    lib/compiler_rt/absv.zig
-    lib/compiler_rt/absvdi2.zig
-    lib/compiler_rt/absvsi2.zig
-    lib/compiler_rt/absvti2.zig
-    lib/compiler_rt/adddf3.zig
-    lib/compiler_rt/addf3.zig
-    lib/compiler_rt/addsf3.zig
-    lib/compiler_rt/addtf3.zig
-    lib/compiler_rt/addvsi3.zig
-    lib/compiler_rt/addvdi3.zig
-    lib/compiler_rt/addxf3.zig
-    lib/compiler_rt/arm.zig
-    lib/compiler_rt/atomics.zig
-    lib/compiler_rt/aulldiv.zig
-    lib/compiler_rt/aullrem.zig
-    lib/compiler_rt/bswap.zig
-    lib/compiler_rt/clear_cache.zig
-    lib/compiler_rt/cmp.zig
-    lib/compiler_rt/cmpdf2.zig
-    lib/compiler_rt/cmpsf2.zig
-    lib/compiler_rt/cmptf2.zig
-    lib/compiler_rt/cmpxf2.zig
-    lib/compiler_rt/common.zig
-    lib/compiler_rt/comparef.zig
-    lib/compiler_rt/cos.zig
-    lib/compiler_rt/count0bits.zig
-    lib/compiler_rt/divdf3.zig
-    lib/compiler_rt/divsf3.zig
-    lib/compiler_rt/divtf3.zig
-    lib/compiler_rt/divti3.zig
-    lib/compiler_rt/divxf3.zig
-    lib/compiler_rt/emutls.zig
-    lib/compiler_rt/exp.zig
-    lib/compiler_rt/exp2.zig
-    lib/compiler_rt/extenddftf2.zig
-    lib/compiler_rt/extenddfxf2.zig
-    lib/compiler_rt/extendf.zig
-    lib/compiler_rt/extendhfsf2.zig
-    lib/compiler_rt/extendhftf2.zig
-    lib/compiler_rt/extendhfxf2.zig
-    lib/compiler_rt/extendsfdf2.zig
-    lib/compiler_rt/extendsftf2.zig
-    lib/compiler_rt/extendsfxf2.zig
-    lib/compiler_rt/extendxftf2.zig
-    lib/compiler_rt/fabs.zig
-    lib/compiler_rt/fixdfdi.zig
-    lib/compiler_rt/fixdfsi.zig
-    lib/compiler_rt/fixdfti.zig
-    lib/compiler_rt/fixhfdi.zig
-    lib/compiler_rt/fixhfsi.zig
-    lib/compiler_rt/fixhfti.zig
-    lib/compiler_rt/fixsfdi.zig
-    lib/compiler_rt/fixsfsi.zig
-    lib/compiler_rt/fixsfti.zig
-    lib/compiler_rt/fixtfdi.zig
-    lib/compiler_rt/fixtfsi.zig
-    lib/compiler_rt/fixtfti.zig
-    lib/compiler_rt/fixunsdfdi.zig
-    lib/compiler_rt/fixunsdfsi.zig
-    lib/compiler_rt/fixunsdfti.zig
-    lib/compiler_rt/fixunshfdi.zig
-    lib/compiler_rt/fixunshfsi.zig
-    lib/compiler_rt/fixunshfti.zig
-    lib/compiler_rt/fixunssfdi.zig
-    lib/compiler_rt/fixunssfsi.zig
-    lib/compiler_rt/fixunssfti.zig
-    lib/compiler_rt/fixunstfdi.zig
-    lib/compiler_rt/fixunstfsi.zig
-    lib/compiler_rt/fixunstfti.zig
-    lib/compiler_rt/fixunsxfdi.zig
-    lib/compiler_rt/fixunsxfsi.zig
-    lib/compiler_rt/fixunsxfti.zig
-    lib/compiler_rt/fixxfdi.zig
-    lib/compiler_rt/fixxfsi.zig
-    lib/compiler_rt/fixxfti.zig
-    lib/compiler_rt/float_from_int.zig
-    lib/compiler_rt/floatdidf.zig
-    lib/compiler_rt/floatdihf.zig
-    lib/compiler_rt/floatdisf.zig
-    lib/compiler_rt/floatditf.zig
-    lib/compiler_rt/floatdixf.zig
-    lib/compiler_rt/floatsidf.zig
-    lib/compiler_rt/floatsihf.zig
-    lib/compiler_rt/floatsisf.zig
-    lib/compiler_rt/floatsitf.zig
-    lib/compiler_rt/floatsixf.zig
-    lib/compiler_rt/floattidf.zig
-    lib/compiler_rt/floattihf.zig
-    lib/compiler_rt/floattisf.zig
-    lib/compiler_rt/floattitf.zig
-    lib/compiler_rt/floattixf.zig
-    lib/compiler_rt/floatundidf.zig
-    lib/compiler_rt/floatundihf.zig
-    lib/compiler_rt/floatundisf.zig
-    lib/compiler_rt/floatunditf.zig
-    lib/compiler_rt/floatundixf.zig
-    lib/compiler_rt/floatunsidf.zig
-    lib/compiler_rt/floatunsihf.zig
-    lib/compiler_rt/floatunsisf.zig
-    lib/compiler_rt/floatunsitf.zig
-    lib/compiler_rt/floatunsixf.zig
-    lib/compiler_rt/floatuntidf.zig
-    lib/compiler_rt/floatuntihf.zig
-    lib/compiler_rt/floatuntisf.zig
-    lib/compiler_rt/floatuntitf.zig
-    lib/compiler_rt/floatuntixf.zig
-    lib/compiler_rt/floor_ceil.zig
-    lib/compiler_rt/fma.zig
-    lib/compiler_rt/fmax.zig
-    lib/compiler_rt/fmin.zig
-    lib/compiler_rt/fmod.zig
-    lib/compiler_rt/gedf2.zig
-    lib/compiler_rt/gesf2.zig
-    lib/compiler_rt/getf2.zig
-    lib/compiler_rt/gexf2.zig
-    lib/compiler_rt/int.zig
-    lib/compiler_rt/int_from_float.zig
-    lib/compiler_rt/log.zig
-    lib/compiler_rt/log10.zig
-    lib/compiler_rt/log2.zig
-    lib/compiler_rt/modti3.zig
-    lib/compiler_rt/mulXi3.zig
-    lib/compiler_rt/muldf3.zig
-    lib/compiler_rt/mulf3.zig
-    lib/compiler_rt/mulo.zig
-    lib/compiler_rt/mulsf3.zig
-    lib/compiler_rt/multf3.zig
-    lib/compiler_rt/mulvsi3.zig
-    lib/compiler_rt/mulxf3.zig
-    lib/compiler_rt/negXi2.zig
-    lib/compiler_rt/negdf2.zig
-    lib/compiler_rt/negsf2.zig
-    lib/compiler_rt/negtf2.zig
-    lib/compiler_rt/negv.zig
-    lib/compiler_rt/negxf2.zig
-    lib/compiler_rt/os_version_check.zig
-    lib/compiler_rt/parity.zig
-    lib/compiler_rt/popcount.zig
-    lib/compiler_rt/rem_pio2.zig
-    lib/compiler_rt/rem_pio2_large.zig
-    lib/compiler_rt/rem_pio2f.zig
-    lib/compiler_rt/round.zig
-    lib/compiler_rt/shift.zig
-    lib/compiler_rt/sin.zig
-    lib/compiler_rt/sincos.zig
-    lib/compiler_rt/sqrt.zig
-    lib/compiler_rt/stack_probe.zig
-    lib/compiler_rt/subdf3.zig
-    lib/compiler_rt/subsf3.zig
-    lib/compiler_rt/subtf3.zig
-    lib/compiler_rt/subvdi3.zig
-    lib/compiler_rt/subvsi3.zig
-    lib/compiler_rt/subxf3.zig
-    lib/compiler_rt/tan.zig
-    lib/compiler_rt/trig.zig
-    lib/compiler_rt/trunc.zig
-    lib/compiler_rt/truncdfhf2.zig
-    lib/compiler_rt/truncdfsf2.zig
-    lib/compiler_rt/truncf.zig
-    lib/compiler_rt/truncsfhf2.zig
-    lib/compiler_rt/trunctfdf2.zig
-    lib/compiler_rt/trunctfhf2.zig
-    lib/compiler_rt/trunctfsf2.zig
-    lib/compiler_rt/trunctfxf2.zig
-    lib/compiler_rt/truncxfdf2.zig
-    lib/compiler_rt/truncxfhf2.zig
-    lib/compiler_rt/truncxfsf2.zig
-    lib/compiler_rt/udivmod.zig
-    lib/compiler_rt/udivmodei4.zig
-    lib/compiler_rt/udivmodti4.zig
-    lib/compiler_rt/udivti3.zig
-    lib/compiler_rt/umodti3.zig
-    lib/compiler_rt/unorddf2.zig
-    lib/compiler_rt/unordsf2.zig
-    lib/compiler_rt/unordtf2.zig
     lib/std/BitStack.zig
     lib/std/Build.zig
     lib/std/Build/Cache.zig
@@ -408,9 +233,6 @@ set(ZIG_STAGE2_SOURCES
     lib/std/Target/wasm.zig
     lib/std/Target/x86.zig
     lib/std/Thread.zig
-    lib/std/Thread/Futex.zig
-    lib/std/Thread/Mutex.zig
-    lib/std/Thread/WaitGroup.zig
     lib/std/array_hash_map.zig
     lib/std/array_list.zig
     lib/std/ascii.zig
@@ -441,7 +263,7 @@ set(ZIG_STAGE2_SOURCES
     lib/std/hash/wyhash.zig
     lib/std/hash_map.zig
     lib/std/heap.zig
-    lib/std/heap/arena_allocator.zig
+    lib/std/heap/ArenaAllocator.zig
     lib/std/json.zig
     lib/std/leb128.zig
     lib/std/log.zig
@@ -508,7 +330,6 @@ set(ZIG_STAGE2_SOURCES
     src/Air/Liveness.zig
     src/Air/Liveness/Verify.zig
     src/Air/print.zig
-    src/Air/types_resolved.zig
     src/Builtin.zig
     src/Compilation.zig
     src/Compilation/Config.zig
@@ -522,12 +343,11 @@ set(ZIG_STAGE2_SOURCES
     src/Sema.zig
     src/Sema/bitcast.zig
     src/Sema/comptime_ptr_access.zig
+    src/Sema/type_resolution.zig
     src/Type.zig
     src/Value.zig
     src/Zcu.zig
     src/Zcu/PerThread.zig
-    src/clang_options.zig
-    src/clang_options_data.zig
     src/codegen.zig
     src/codegen/aarch64.zig
     src/codegen/aarch64/abi.zig
@@ -538,7 +358,8 @@ set(ZIG_STAGE2_SOURCES
     src/codegen/aarch64/Mir.zig
     src/codegen/aarch64/Select.zig
     src/codegen/c.zig
-    src/codegen/c/Type.zig
+    src/codegen/c/type.zig
+    src/codegen/c/type/render_defs.zig
     src/codegen/llvm.zig
     src/codegen/llvm/bindings.zig
     src/crash_report.zig
@@ -553,6 +374,7 @@ set(ZIG_STAGE2_SOURCES
     src/libs/libunwind.zig
     src/link.zig
     src/link/C.zig
+    src/link/ConstPool.zig
     src/link/Coff.zig
     src/link/Dwarf.zig
     src/link/Elf.zig
@@ -784,10 +606,10 @@ if(MSVC)
   set(ZIG2_LINK_FLAGS "/STACK:16777216 /FORCE:MULTIPLE")
 else()
   set(ZIG_WASM2C_COMPILE_FLAGS "-std=c99 -O2")
-  set(ZIG1_COMPILE_FLAGS "-std=c99 -Os")
-  set(ZIG2_COMPILE_FLAGS "-std=c99 -O0 -fno-sanitize=undefined -fno-stack-protector")
+  set(ZIG1_COMPILE_FLAGS "-std=c99 -Os -fno-strict-aliasing")
+  set(ZIG2_COMPILE_FLAGS "-std=c99 -O0 -fno-sanitize=undefined -fno-stack-protector -fno-strict-aliasing")
   # Must match the condition in build.zig.
-  if(ZIG_HOST_TARGET_ARCH MATCHES "^powerpc(64)?(le)?$")
+  if(ZIG_HOST_TARGET_ARCH MATCHES "^(arm|thumb)(eb)?$" OR ZIG_HOST_TARGET_ARCH MATCHES "^powerpc(64)?(le)?$")
     set(ZIG1_COMPILE_FLAGS "${ZIG1_COMPILE_FLAGS} -ffunction-sections -fdata-sections")
     set(ZIG2_COMPILE_FLAGS "${ZIG2_COMPILE_FLAGS} -ffunction-sections -fdata-sections")
   endif()
@@ -800,6 +622,23 @@ else()
     unset(ZIG2_LINK_FLAGS)
   else()
     set(ZIG2_LINK_FLAGS "-Wl,-z,stack-size=0x10000000")
+  endif()
+  if (CMAKE_C_COMPILER_ID STREQUAL "GNU")
+    # Prevent GCC from miscompiling 'zig2.c'. See also 'GCC_BUG_119085_PRESENT' workaround details in 'bootstrap.c'.
+    if (
+      (CMAKE_C_COMPILER_VERSION VERSION_GREATER_EQUAL "10.0" AND
+       CMAKE_C_COMPILER_VERSION VERSION_LESS_EQUAL "13.4") OR
+      (CMAKE_C_COMPILER_VERSION VERSION_GREATER_EQUAL "14.0" AND
+       CMAKE_C_COMPILER_VERSION VERSION_LESS_EQUAL "14.3") OR
+      (CMAKE_C_COMPILER_VERSION VERSION_GREATER_EQUAL "15.0" AND
+       CMAKE_C_COMPILER_VERSION VERSION_LESS "15.2")
+    )
+      set(ZIG2_COMPILE_FLAGS "${ZIG2_COMPILE_FLAGS} -fno-tree-sra")
+    endif()
+
+    # Prevent GCC from spamming false positive `-Waddress-of-packed-member` warnings in 'zig2.c'.
+    # See also 'GCC_BUG_94081_PRESENT' workaround details in 'bootstrap.c'.
+    set(ZIG2_COMPILE_FLAGS "${ZIG2_COMPILE_FLAGS} -Wno-address-of-packed-member")
   endif()
 endif()
 

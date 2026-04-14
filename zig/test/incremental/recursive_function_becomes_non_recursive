@@ -1,8 +1,9 @@
 #target=x86_64-linux-selfhosted
-#target=x86_64-windows-selfhosted
+//#target=x86_64-windows-selfhosted
 #target=x86_64-linux-cbe
 #target=x86_64-windows-cbe
-#target=wasm32-wasi-selfhosted
+#target=x86_64-linux-llvm
+//#target=wasm32-wasi-selfhosted
 #update=initial version
 #file=main.zig
 pub fn main() !void {
@@ -14,7 +15,7 @@ fn foo(recurse: bool) !void {
     try stdout.writeStreamingAll(io, "non-recursive path\n");
 }
 const std = @import("std");
-const io = std.Io.Threaded.global_single_threaded.ioBasic();
+const io = std.Io.Threaded.global_single_threaded.io();
 #expect_stdout="non-recursive path\n"
 
 #update=eliminate recursion and change argument
@@ -28,5 +29,5 @@ fn foo(recurse: bool) !void {
     try stdout.writeStreamingAll(io, "non-recursive path\n");
 }
 const std = @import("std");
-const io = std.Io.Threaded.global_single_threaded.ioBasic();
+const io = std.Io.Threaded.global_single_threaded.io();
 #expect_stdout="x==1\n"

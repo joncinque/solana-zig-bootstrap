@@ -1702,6 +1702,10 @@ const ElfDumper = struct {
             return error.InvalidArchiveMagicNumber;
         }
 
+        if (!mem.isAligned(bytes.len, 2)) {
+            return error.InvalidArchivePadding;
+        }
+
         var ctx = ArchiveContext{
             .gpa = gpa,
             .data = bytes,
@@ -1715,8 +1719,8 @@ const ElfDumper = struct {
         }
 
         while (true) {
-            if (reader.seek >= ctx.data.len) break;
             if (!mem.isAligned(reader.seek, 2)) reader.seek += 1;
+            if (reader.seek >= ctx.data.len) break;
 
             const hdr = try reader.takeStruct(elf.ar_hdr, .little);
 
@@ -1810,16 +1814,16 @@ const ElfDumper = struct {
                 files.putAssumeCapacityNoClobber(object.off - @sizeOf(elf.ar_hdr), object.name);
             }
 
-            var symbols = std.AutoArrayHashMap(usize, std.array_list.Managed([]const u8)).init(ctx.gpa);
+            var symbols: std.array_hash_map.Auto(usize, std.array_list.Managed([]const u8)) = .empty;
             defer {
                 for (symbols.values()) |*value| {
                     value.deinit();
                 }
-                symbols.deinit();
+                symbols.deinit(ctx.gpa);
             }
 
             for (ctx.symtab.items) |entry| {
-                const gop = try symbols.getOrPut(@intCast(entry.off));
+                const gop = try symbols.getOrPut(ctx.gpa, @intCast(entry.off));
                 if (!gop.found_existing) {
                     gop.value_ptr.* = std.array_list.Managed([]const u8).init(ctx.gpa);
                 }

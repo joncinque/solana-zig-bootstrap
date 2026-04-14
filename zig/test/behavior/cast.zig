@@ -116,6 +116,10 @@ test "@floatFromInt" {
             const f = @as(f32, @floatFromInt(k));
             const i = @as(i32, @intFromFloat(f));
             try expect(i == k);
+            try expect(@as(i32, @round(f)) == k);
+            try expect(@as(i32, @floor(f)) == k);
+            try expect(@as(i32, @ceil(f)) == k);
+            try expect(@as(i32, @trunc(f)) == k);
         }
     };
     try S.doTheTest();
@@ -139,6 +143,10 @@ test "@floatFromInt(f80)" {
             const f = @as(f80, @floatFromInt(k));
             const i = @as(Int, @intFromFloat(f));
             try expect(i == k);
+            try expect(@as(Int, @round(f)) == k);
+            try expect(@as(Int, @floor(f)) == k);
+            try expect(@as(Int, @ceil(f)) == k);
+            try expect(@as(Int, @trunc(f)) == k);
         }
     };
     try S.doTheTest(i31);
@@ -167,6 +175,10 @@ test "type coercion from int to float" {
             try std.testing.expectEqual(int, @as(Int, @intFromFloat(float)));
             try std.testing.expectEqual(int, @as(Int, @intFromFloat(@ceil(float))));
             try std.testing.expectEqual(int, @as(Int, @intFromFloat(@floor(float))));
+            try std.testing.expectEqual(int, @as(Int, @round(float)));
+            try std.testing.expectEqual(int, @as(Int, @ceil(float)));
+            try std.testing.expectEqual(int, @as(Int, @floor(float)));
+            try std.testing.expectEqual(int, @as(Int, @trunc(float)));
         }
 
         // Exhaustively check that all possible values of the integer type can
@@ -175,6 +187,7 @@ test "type coercion from int to float" {
             var int: Int = std.math.minInt(Int);
             while (int < std.math.maxInt(Int)) : (int += 1)
                 try value(Float, int);
+            try value(Float, int); // max
         }
 
         // Check that the min and max values of the integer type can safely be
@@ -202,6 +215,8 @@ test "type coercion from int to float" {
     try check.edgeValues(f128, u113);
     try check.edgeValues(f128, i114);
 
+    try check.value(c_longdouble, @as(u1, 0)); // Smoke test - size varies by target.
+
     if (builtin.zig_backend == .stage2_aarch64) return error.SkipZigTest;
     if (builtin.zig_backend == .stage2_wasm) return error.SkipZigTest;
 
@@ -227,10 +242,52 @@ fn testIntFromFloats() !void {
     try expectIntFromFloat(f32, 255.1, u8, 255);
     try expectIntFromFloat(f32, 127.2, i8, 127);
     try expectIntFromFloat(f32, -128.2, i8, -128);
+
+    try expectRoundCast(f32, 255.1, u8, 255);
+    try expectFloorCast(f32, 255.1, u8, 255);
+    try expectTruncCast(f32, 255.1, u8, 255);
+
+    try expectRoundCast(f32, 127.2, i8, 127);
+    try expectFloorCast(f32, 127.2, i8, 127);
+    try expectTruncCast(f32, 127.2, i8, 127);
+
+    try expectRoundCast(f32, -128.2, i8, -128);
+    try expectCeilCast(f32, -128.2, i8, -128);
+    try expectTruncCast(f32, -128.2, i8, -128);
+}
+
+test "rounding builtins with anytype and context propagation" {
+    const S = struct {
+        const x: i32 = 10;
+        fn check(expected: anytype, actual: anytype) !void {
+            try expectEqual(expected, actual);
+        }
+    };
+    try expectEqual(@as(f32, 1.0), @round(@as(f32, 1.4)));
+    try S.check(@as(f32, 1.0), @round(@as(f32, 1.4)));
+
+    const y: f64 = @floor(@floatFromInt(S.x));
+    try expect(y == 10.0);
+
+    try expectEqual(1.0, @round(1.4));
+    try S.check(1.0, @round(1.4));
 }
 
 fn expectIntFromFloat(comptime F: type, f: F, comptime I: type, i: I) !void {
     try expect(@as(I, @intFromFloat(f)) == i);
+}
+
+fn expectRoundCast(comptime F: type, f: F, comptime I: type, i: I) !void {
+    try expect(@as(I, @round(f)) == i);
+}
+fn expectFloorCast(comptime F: type, f: F, comptime I: type, i: I) !void {
+    try expect(@as(I, @floor(f)) == i);
+}
+fn expectCeilCast(comptime F: type, f: F, comptime I: type, i: I) !void {
+    try expect(@as(I, @ceil(f)) == i);
+}
+fn expectTruncCast(comptime F: type, f: F, comptime I: type, i: I) !void {
+    try expect(@as(I, @trunc(f)) == i);
 }
 
 test "implicitly cast indirect pointer to maybe-indirect pointer" {
@@ -1306,6 +1363,12 @@ test "comptime float casts" {
 
     try expectIntFromFloat(comptime_int, 1234, i16, 1234);
     try expectIntFromFloat(comptime_float, 12.3, comptime_int, 12);
+
+    try expectRoundCast(comptime_float, 12.3, comptime_int, 12);
+
+    try expectFloorCast(comptime_float, 12.3, comptime_int, 12);
+    try expectCeilCast(comptime_float, 12.3, comptime_int, 13);
+    try expectTruncCast(comptime_float, 12.3, comptime_int, 12);
 }
 
 test "pointer reinterpret const float to int" {
@@ -1541,6 +1604,20 @@ test "*const [N]null u8 to ?[]const u8" {
     try comptime S.doTheTest();
 }
 
+test "comptime @ptrCast to optional slice" {
+    if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_spirv) return error.SkipZigTest;
+
+    const result: ?[]const u8 = comptime blk: {
+        const slice: []const u8 = "123";
+        break :blk @ptrCast(slice);
+    };
+
+    comptime assert(mem.eql(u8, result.?, "123"));
+    try expectEqualSlices(u8, "123", result.?);
+}
+
 test "cast between [*c]T and ?[*:0]T on fn parameter" {
     const S = struct {
         const Handler = ?fn ([*c]const u8) callconv(.c) void;
@@ -1739,6 +1816,10 @@ test "intFromFloat to zero-bit int" {
 
     const a: f32 = 0.0;
     try comptime std.testing.expect(@as(u0, @intFromFloat(a)) == 0);
+    try comptime std.testing.expect(@as(u0, @round(a)) == 0);
+    try comptime std.testing.expect(@as(u0, @floor(a)) == 0);
+    try comptime std.testing.expect(@as(u0, @ceil(a)) == 0);
+    try comptime std.testing.expect(@as(u0, @trunc(a)) == 0);
 }
 
 test "peer type resolution of function pointer and function body" {
@@ -1922,6 +2003,47 @@ test "peer type resolution: float and comptime-known fixed-width integer" {
 
     try expectEqual(@as(T, 100.0), r1);
     try expectEqual(@as(T, 1.234), r2);
+}
+
+test "peer type resolution: float and runtime-known fixed-width integer" {
+    if (builtin.zig_backend == .stage2_arm) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_sparc64) return error.SkipZigTest; // TODO
+
+    const S = struct {
+        fn testPeerType(Float: type, Int: type) !void {
+            var i: Int = 100;
+            _ = &i;
+            var f: Float = 1.234;
+            _ = &f;
+            comptime assert(@TypeOf(i, f) == Float);
+            comptime assert(@TypeOf(f, i) == Float);
+
+            var t = true;
+            _ = &t;
+            const r1 = if (t) i else f;
+            const r2 = if (t) f else i;
+
+            try expectEqual(@as(Float, 100.0), r1);
+            try expectEqual(@as(Float, 1.234), r2);
+        }
+    };
+
+    try S.testPeerType(f16, u11);
+    try S.testPeerType(f16, i12);
+
+    try S.testPeerType(f32, u24);
+    try S.testPeerType(f32, i25);
+
+    try S.testPeerType(f64, u53);
+    try S.testPeerType(f64, i54);
+
+    try S.testPeerType(f80, u64);
+    try S.testPeerType(f80, i65);
+
+    try S.testPeerType(f128, u113);
+    try S.testPeerType(f128, i114);
+
+    try S.testPeerType(c_longdouble, u8); // Smoke test - size varies by target.
 }
 
 test "peer type resolution: same array type with sentinel" {

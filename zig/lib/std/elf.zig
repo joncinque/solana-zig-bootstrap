@@ -1071,7 +1071,7 @@ pub const Elf32 = struct {
     pub const Shdr = extern struct {
         name: Word,
         type: SHT,
-        flags: packed struct { shf: SHF },
+        flags: packed struct(Word) { shf: SHF },
         addr: Elf32.Addr,
         offset: Elf32.Off,
         size: Word,
@@ -1161,7 +1161,7 @@ pub const Elf64 = struct {
     pub const Shdr = extern struct {
         name: Word,
         type: SHT,
-        flags: packed struct { shf: SHF, unused: Word = 0 },
+        flags: packed struct(Xword) { shf: SHF, unused: Word = 0 },
         addr: Elf64.Addr,
         offset: Elf64.Off,
         size: Xword,
@@ -3062,6 +3062,8 @@ fn genSpecialMemberName(comptime name: []const u8) *const [16]u8 {
 // member indicates, for each member file.
 /// String that begins an archive file.
 pub const ARMAG = "!<arch>\n";
+/// String that begins a thin archive file.
+pub const ARMAG_THIN = "!<thin>\n";
 /// String in ar_fmag at the end of each header.
 pub const ARFMAG = "`\n";
 /// 32-bit symtab identifier

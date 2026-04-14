@@ -278,7 +278,7 @@ pub fn flush(
     };
     result catch |err| switch (err) {
         error.OutOfMemory, error.LinkFailure => |e| return e,
-        else => |e| return lld.base.comp.link_diags.fail("failed to link with LLD: {s}", .{@errorName(e)}),
+        else => |e| return lld.base.comp.link_diags.fail("failed to link with LLD: {t}", .{e}),
     };
 }
 
@@ -356,6 +356,16 @@ fn linkAsArchive(lld: *Lld, arena: Allocator) !void {
     if (bad) return error.UnableToWriteArchive;
 }
 
+fn addCommonArgs(argv: *std.array_list.Managed([]const u8), coff: bool) !void {
+    if (builtin.os.tag == .netbsd) {
+        // NetBSD 10.1's `malloc` appears to have some nasty bugs that occur
+        // when doing parallel linking in LLD, manifesting as input and/or
+        // output section memory randomly being unmapped. So just don't do
+        // parallel linking for now.
+        try argv.append(if (coff) "-threads:1" else "--threads=1");
+    }
+}
+
 fn coffLink(lld: *Lld, arena: Allocator) !void {
     const comp = lld.base.comp;
     const gpa = comp.gpa;
@@ -418,6 +428,7 @@ fn coffLink(lld: *Lld, arena: Allocator) !void {
         // it calls exit() and does not reset all global data between invocations.
         const linker_command = "lld-link";
         try argv.appendSlice(&[_][]const u8{ comp.self_exe_path.?, linker_command });
+        try addCommonArgs(&argv, true);
 
         if (target.isMinGW()) {
             try argv.append("-lldmingw");
@@ -836,6 +847,8 @@ fn elfLink(lld: *Lld, arena: Allocator) !void {
         // it calls exit() and does not reset all global data between invocations.
         const linker_command = "ld.lld";
         try argv.appendSlice(&[_][]const u8{ comp.self_exe_path.?, linker_command });
+        try addCommonArgs(&argv, false);
+
         if (is_obj) {
             try argv.append("-r");
         }
@@ -857,6 +870,11 @@ fn elfLink(lld: *Lld, arena: Allocator) !void {
             "-mllvm",
             try std.fmt.allocPrint(arena, "-float-abi={s}", .{if (target.abi.float() == .hard) "hard" else "soft"}),
         });
+
+        switch (target.cpu.arch) {
+            .armeb, .thumbeb => if (is_exe_or_dyn_lib and target.cpu.has(.arm, .has_v6)) try argv.append("--be8"),
+            else => {},
+        }
 
         if (comp.config.lto != .none) {
             switch (comp.root_mod.optimize_mode) {
@@ -1401,6 +1419,8 @@ fn wasmLink(lld: *Lld, arena: Allocator) !void {
         // it calls exit() and does not reset all global data between invocations.
         const linker_command = "wasm-ld";
         try argv.appendSlice(&[_][]const u8{ comp.self_exe_path.?, linker_command });
+        try addCommonArgs(&argv, false);
+
         try argv.append("--error-limit=0");
 
         if (comp.config.lto != .none) {
@@ -1630,7 +1650,11 @@ fn spawnLld(comp: *Compilation, arena: Allocator, argv: []const []const u8) !voi
         }) catch |err| break :term err;
 
         var stderr_reader = child.stderr.?.readerStreaming(io, &.{});
-        stderr = try stderr_reader.interface.allocRemaining(gpa, .unlimited);
+        stderr = stderr_reader.interface.allocRemaining(gpa, .unlimited) catch |err| switch (err) {
+            error.StreamTooLong => unreachable, // unlimited
+            error.OutOfMemory => |e| return e,
+            error.ReadFailed => return stderr_reader.err.?,
+        };
         break :term child.wait(io);
     }) catch |first_err| term: {
         const err = switch (first_err) {
@@ -1682,7 +1706,11 @@ fn spawnLld(comp: *Compilation, arena: Allocator, argv: []const []const u8) !voi
                     break :term rsp_child.wait(io) catch |err| break :err err;
                 } else {
                     var stderr_reader = rsp_child.stderr.?.readerStreaming(io, &.{});
-                    stderr = try stderr_reader.interface.allocRemaining(gpa, .unlimited);
+                    stderr = stderr_reader.interface.allocRemaining(gpa, .unlimited) catch |err| switch (err) {
+                        error.StreamTooLong => unreachable, // unlimited
+                        error.OutOfMemory => |e| return e,
+                        error.ReadFailed => return stderr_reader.err.?,
+                    };
                     break :term rsp_child.wait(io) catch |err| break :err err;
                 }
             },
@@ -1699,15 +1727,24 @@ fn spawnLld(comp: *Compilation, arena: Allocator, argv: []const []const u8) !voi
             diags.lockAndParseLldStderr(argv[1], stderr);
             return error.LinkFailure;
         },
-        else => {
+        .signal => |sig| {
             if (comp.clang_passthrough_mode) std.process.abort();
-            return diags.fail("{s} terminated with stderr:\n{s}", .{ argv[0], stderr });
+            return diags.fail("{s} terminated with signal {t} and stderr:\n{s}", .{ argv[0], sig, stderr });
+        },
+        .stopped => |sig| {
+            if (comp.clang_passthrough_mode) std.process.abort();
+            return diags.fail("{s} stopped with signal {t} and stderr:\n{s}", .{ argv[0], sig, stderr });
+        },
+        .unknown => |code| {
+            if (comp.clang_passthrough_mode) std.process.abort();
+            return diags.fail("{s} terminated for unknown reason with code {d} and stderr:\n{s}", .{ argv[0], code, stderr });
         },
     }
 
     if (stderr.len > 0) log.warn("unexpected LLD stderr:\n{s}", .{stderr});
 }
 
+const builtin = @import("builtin");
 const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;

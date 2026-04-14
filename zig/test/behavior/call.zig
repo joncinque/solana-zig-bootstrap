@@ -551,19 +551,18 @@ test "generic function pointer can be called" {
 
 test "value returned from comptime function is comptime known" {
     const S = struct {
-        fn fields(comptime T: type) switch (@typeInfo(T)) {
-            .@"struct" => []const std.builtin.Type.StructField,
+        fn fieldCount(comptime T: type) switch (@typeInfo(T)) {
+            .@"struct" => comptime_int,
             else => unreachable,
         } {
             return switch (@typeInfo(T)) {
-                .@"struct" => |info| info.fields,
+                .@"struct" => |info| info.fields.len,
                 else => unreachable,
             };
         }
     };
-    const fields_list = S.fields(@TypeOf(.{}));
-    if (fields_list.len != 0)
-        @compileError("Argument count mismatch");
+    const fields_len = S.fieldCount(@TypeOf(.{}));
+    comptime assert(fields_len == 0);
 }
 
 test "registers get overwritten when ignoring return" {
@@ -731,4 +730,34 @@ test "tail call function pointer" {
     };
 
     S.foo(100);
+}
+
+test "tail call with potentially extended types" {
+    if (builtin.zig_backend == .stage2_wasm) return error.SkipZigTest; // TODO
+    if (builtin.zig_backend == .stage2_x86_64) return error.SkipZigTest; // TODO
+
+    if (builtin.zig_backend == .stage2_llvm) {
+        if (builtin.cpu.arch.isMIPS() or builtin.cpu.arch.isPowerPC() or builtin.cpu.arch.isWasm()) {
+            return error.SkipZigTest;
+        }
+    }
+
+    if (builtin.zig_backend == .stage2_c and builtin.os.tag == .windows) return error.SkipZigTest; // MSVC doesn't support always tail calls
+
+    const S = struct {
+        fn Test(comptime Return: type) type {
+            return struct {
+                fn callee(@"u8": u8, @"i8": i8, @"u16": u16, @"i16": i16) callconv(.c) Return {
+                    return @intCast(@as(i32, @"u8") + @as(i32, @"i8") + @as(i32, @"u16") + @as(i32, @"i16"));
+                }
+                fn caller(@"u8": u8, @"i8": i8, @"u16": u16, @"i16": i16) callconv(.c) Return {
+                    return @call(.always_tail, callee, .{ @"u8", @"i8", @"u16", @"i16" });
+                }
+            };
+        }
+    };
+    try std.testing.expect(S.Test(u8).caller(1, -2, 3, 4) == 6);
+    try std.testing.expect(S.Test(i8).caller(5, -6, 7, -8) == -2);
+    try std.testing.expect(S.Test(u16).caller(9, 10, 11, 12) == 42);
+    try std.testing.expect(S.Test(i16).caller(13, 14, 15, -16) == 26);
 }

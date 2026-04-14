@@ -33,6 +33,7 @@ const arch_bits = switch (native_arch) {
     .aarch64, .aarch64_be => @import("linux/aarch64.zig"),
     .arm, .armeb, .thumb, .thumbeb => @import("linux/arm.zig"),
     .hexagon => @import("linux/hexagon.zig"),
+    .loongarch32 => @import("linux/loongarch32.zig"),
     .loongarch64 => @import("linux/loongarch64.zig"),
     .m68k => @import("linux/m68k.zig"),
     .mips, .mipsel => @import("linux/mips.zig"),
@@ -118,6 +119,7 @@ pub const SYS = switch (native_arch) {
     .arm, .armeb, .thumb, .thumbeb => syscalls.Arm,
     .csky => syscalls.CSky,
     .hexagon => syscalls.Hexagon,
+    .loongarch32 => syscalls.LoongArch32,
     .loongarch64 => syscalls.LoongArch64,
     .m68k => syscalls.M68k,
     .mips, .mipsel => syscalls.MipsO32,
@@ -146,6 +148,7 @@ pub const MAP_TYPE = enum(u4) {
     SHARED = 0x01,
     PRIVATE = 0x02,
     SHARED_VALIDATE = 0x03,
+    DROPPABLE = 0x08,
 };
 
 pub const MAP = switch (native_arch) {
@@ -192,7 +195,7 @@ pub const MAP = switch (native_arch) {
         UNINITIALIZED: bool = false,
         _: u5 = 0,
     },
-    .riscv32, .riscv64, .loongarch64 => packed struct(u32) {
+    .riscv32, .riscv64, .loongarch32, .loongarch64 => packed struct(u32) {
         TYPE: MAP_TYPE,
         FIXED: bool = false,
         ANONYMOUS: bool = false,
@@ -328,7 +331,7 @@ pub const O = switch (native_arch) {
         TMPFILE: bool = false,
         _23: u9 = 0,
     },
-    .x86, .riscv32, .riscv64, .loongarch64 => packed struct(u32) {
+    .x86, .riscv32, .riscv64, .loongarch32, .loongarch64 => packed struct(u32) {
         ACCMODE: ACCMODE = .RDONLY,
         _2: u4 = 0,
         CREAT: bool = false,
@@ -590,6 +593,10 @@ pub fn errno(r: usize) E {
     const signed_r: isize = @bitCast(r);
     const int = if (signed_r > -4096 and signed_r < 0) -signed_r else 0;
     return @enumFromInt(int);
+}
+
+pub fn brk(addr: usize) usize {
+    return syscall1(.brk, addr);
 }
 
 pub fn dup(old: i32) usize {
@@ -1112,6 +1119,14 @@ pub fn pivot_root(new_root: [*:0]const u8, put_old: [*:0]const u8) usize {
     return syscall2(.pivot_root, @intFromPtr(new_root), @intFromPtr(put_old));
 }
 
+fn mmap2Unit() u64 {
+    return switch (native_arch) {
+        .arc, .arceb, .m68k => std.heap.pageSize(),
+        .or1k => 8 << 10,
+        else => 4 << 10,
+    };
+}
+
 pub fn mmap(address: ?[*]u8, length: usize, prot: PROT, flags: MAP, fd: i32, offset: i64) usize {
     if (@hasField(SYS, "mmap2")) {
         return syscall6(
@@ -1121,7 +1136,7 @@ pub fn mmap(address: ?[*]u8, length: usize, prot: PROT, flags: MAP, fd: i32, off
             @as(u32, @bitCast(prot)),
             @as(u32, @bitCast(flags)),
             @bitCast(@as(isize, fd)),
-            @truncate(@as(u64, @bitCast(offset)) / std.heap.pageSize()),
+            @truncate(@as(u64, @bitCast(offset)) / mmap2Unit()),
         );
     } else {
         // The s390x mmap() syscall existed before Linux supported syscalls with 5+ parameters, so
@@ -1391,6 +1406,10 @@ pub fn faccessat(dirfd: i32, path: [*:0]const u8, mode: u32, flags: u32) usize {
     return syscall4(.faccessat2, @as(usize, @bitCast(@as(isize, dirfd))), @intFromPtr(path), mode, flags);
 }
 
+pub fn acct(path: [*:0]const u8) usize {
+    return syscall1(.acct, @intFromPtr(path));
+}
+
 pub fn pipe(fd: *[2]i32) usize {
     if (comptime (native_arch.isMIPS() or native_arch.isSPARC())) {
         return syscall_pipe(fd);
@@ -1565,7 +1584,12 @@ pub fn clone2(flags: u32, child_stack_ptr: usize) usize {
     return syscall2(.clone, flags, child_stack_ptr);
 }
 
-pub fn close(fd: i32) usize {
+/// This call cannot fail, and the return value is the caller's thread id
+pub fn set_tid_address(tidptr: ?*pid_t) pid_t {
+    return @intCast(@as(u32, @truncate(syscall1(.set_tid_address, @intFromPtr(tidptr)))));
+}
+
+pub fn close(fd: fd_t) usize {
     return syscall1(.close, @as(usize, @bitCast(@as(isize, fd))));
 }
 
@@ -1601,11 +1625,27 @@ pub fn fchown(fd: i32, owner: uid_t, group: gid_t) usize {
     }
 }
 
+pub fn fchownat(fd: i32, path: [*:0]const u8, owner: uid_t, group: gid_t, flags: u32) usize {
+    return syscall5(.fchownat, @as(usize, @bitCast(@as(isize, fd))), @intFromPtr(path), owner, group, flags);
+}
+
 pub fn chown(path: [*:0]const u8, owner: uid_t, group: gid_t) usize {
     if (@hasField(SYS, "chown32")) {
         return syscall3(.chown32, @intFromPtr(path), owner, group);
-    } else {
+    } else if (@hasField(SYS, "chown")) {
         return syscall3(.chown, @intFromPtr(path), owner, group);
+    } else {
+        return fchownat(AT.FDCWD, path, owner, group, 0);
+    }
+}
+
+pub fn lchown(path: [*:0]const u8, owner: uid_t, group: gid_t) usize {
+    if (@hasField(SYS, "lchown32")) {
+        return syscall3(.lchown32, @intFromPtr(path), owner, group);
+    } else if (@hasField(SYS, "lchown")) {
+        return syscall3(.lchown, @intFromPtr(path), owner, group);
+    } else {
+        return fchownat(AT.FDCWD, path, owner, group, AT.SYMLINK_NOFOLLOW);
     }
 }
 
@@ -1827,6 +1867,32 @@ pub const F = struct {
     pub const RDLCK = if (is_sparc) 1 else 0;
     pub const WRLCK = if (is_sparc) 2 else 1;
     pub const UNLCK = if (is_sparc) 3 else 2;
+
+    pub const LINUX_SPECIFIC_BASE = 1024;
+
+    pub const SETLEASE = LINUX_SPECIFIC_BASE + 0;
+    pub const GETLEASE = LINUX_SPECIFIC_BASE + 1;
+    pub const NOTIFY = LINUX_SPECIFIC_BASE + 2;
+    pub const DUPFD_QUERY = LINUX_SPECIFIC_BASE + 3;
+    pub const CREATED_QUERY = LINUX_SPECIFIC_BASE + 4;
+    pub const CANCELLK = LINUX_SPECIFIC_BASE + 5;
+    pub const DUPFD_CLOEXEC = LINUX_SPECIFIC_BASE + 6;
+    pub const SETPIPE_SZ = LINUX_SPECIFIC_BASE + 7;
+    pub const GETPIPE_SZ = LINUX_SPECIFIC_BASE + 8;
+    pub const ADD_SEALS = LINUX_SPECIFIC_BASE + 9;
+    pub const GET_SEALS = LINUX_SPECIFIC_BASE + 10;
+
+    pub const SEAL_SEAL = 0x0001;
+    pub const SEAL_SHRINK = 0x0002;
+    pub const SEAL_GROW = 0x0004;
+    pub const SEAL_WRITE = 0x0008;
+    pub const SEAL_FUTURE_WRITE = 0x0010;
+    pub const SEAL_EXEC = 0x0020;
+
+    pub const GET_RW_HINT = LINUX_SPECIFIC_BASE + 11;
+    pub const SET_RW_HINT = LINUX_SPECIFIC_BASE + 12;
+    pub const GET_FILE_RW_HINT = LINUX_SPECIFIC_BASE + 13;
+    pub const SET_FILE_RW_HINT = LINUX_SPECIFIC_BASE + 14;
 };
 
 pub const F_OWNER = enum(i32) {
@@ -1893,21 +1959,21 @@ fn init_vdso_clock_gettime(clk: clockid_t, ts: *timespec) callconv(.c) usize {
     @atomicStore(?VdsoClockGettime, &vdso_clock_gettime, ptr, .monotonic);
     // Call into the VDSO if available
     if (ptr) |f| return f(clk, ts);
-    return @as(usize, @bitCast(-@as(isize, @intFromEnum(E.NOSYS))));
+    return @bitCast(-@as(isize, @intFromEnum(E.NOSYS)));
 }
 
-pub fn clock_getres(clk_id: i32, tp: *timespec) usize {
+pub fn clock_getres(clk_id: clockid_t, tp: *timespec) usize {
     return syscall2(
         if (@hasField(SYS, "clock_getres") and native_arch != .hexagon) .clock_getres else .clock_getres_time64,
-        @as(usize, @bitCast(@as(isize, clk_id))),
+        @as(usize, @intFromEnum(clk_id)),
         @intFromPtr(tp),
     );
 }
 
-pub fn clock_settime(clk_id: i32, tp: *const timespec) usize {
+pub fn clock_settime(clk_id: clockid_t, tp: *const timespec) usize {
     return syscall2(
         if (@hasField(SYS, "clock_settime") and native_arch != .hexagon) .clock_settime else .clock_settime64,
-        @as(usize, @bitCast(@as(isize, clk_id))),
+        @as(usize, @intFromEnum(clk_id)),
         @intFromPtr(tp),
     );
 }
@@ -2064,7 +2130,11 @@ pub fn setpgid(pid: pid_t, pgid: pid_t) usize {
     return syscall2(.setpgid, @intCast(pid), @intCast(pgid));
 }
 
-pub fn getgroups(size: usize, list: ?*gid_t) usize {
+pub fn getpgid(pid: pid_t) usize {
+    return syscall1(.getpgid, @intCast(pid));
+}
+
+pub fn getgroups(size: usize, list: ?[*]gid_t) usize {
     if (@hasField(SYS, "getgroups32")) {
         return syscall2(.getgroups32, size, @intFromPtr(list));
     } else {
@@ -2082,6 +2152,10 @@ pub fn setgroups(size: usize, list: [*]const gid_t) usize {
 
 pub fn setsid() usize {
     return syscall0(.setsid);
+}
+
+pub fn getsid(pid: pid_t) usize {
+    return syscall1(.getsid, @intCast(pid));
 }
 
 pub fn getpid() pid_t {
@@ -3809,8 +3883,8 @@ pub const W = struct {
     pub fn TERMSIG(s: u32) SIG {
         return @enumFromInt(s & 0x7f);
     }
-    pub fn STOPSIG(s: u32) u32 {
-        return EXITSTATUS(s);
+    pub fn STOPSIG(s: u32) SIG {
+        return @enumFromInt(EXITSTATUS(s));
     }
     pub fn IFEXITED(s: u32) bool {
         return (s & 0x7f) == 0;
@@ -5881,11 +5955,6 @@ pub const S = struct {
     }
 };
 
-pub const UTIME = struct {
-    pub const NOW = 0x3fffffff;
-    pub const OMIT = 0x3ffffffe;
-};
-
 const TFD_TIMER = packed struct(u32) {
     ABSTIME: bool = false,
     CANCEL_ON_SET: bool = false,
@@ -6277,6 +6346,7 @@ pub const MINSIGSTKSZ = switch (native_arch) {
     .xtensa,
     .xtensaeb,
     => 2048,
+    .loongarch32,
     .loongarch64,
     .sparc,
     .sparc64,
@@ -6316,6 +6386,7 @@ pub const SIGSTKSZ = switch (native_arch) {
     => 8192,
     .aarch64,
     .aarch64_be,
+    .loongarch32,
     .loongarch64,
     .sparc,
     .sparc64,
@@ -6662,9 +6733,10 @@ pub const IORING_ACCEPT_MULTISHOT = 1 << 0;
 /// IORING_OP_MSG_RING command types, stored in sqe->addr
 pub const IORING_MSG_RING_COMMAND = enum(u8) {
     /// pass sqe->len as 'res' and off as user_data
-    DATA,
+    DATA = 0,
     /// send a registered fd to another ring
-    SEND_FD,
+    SEND_FD = 1,
+    _,
 };
 
 // io_uring_sqe.msg_ring_flags (rw_flags in the Zig struct)
@@ -6717,6 +6789,8 @@ pub const IORING_CQE_F_SOCK_NONEMPTY = 1 << 2;
 pub const IORING_CQE_F_NOTIF = 1 << 3;
 /// If set, the buffer ID set in the completion will get more completions.
 pub const IORING_CQE_F_BUF_MORE = 1 << 4;
+pub const IORING_CQE_F_SKIP = 1 << 5;
+pub const IORING_CQE_F_32 = 1 << 15;
 
 pub const IORING_CQE_BUFFER_SHIFT = 16;
 
@@ -7013,7 +7087,7 @@ pub const IORING_RESTRICTION = enum(u16) {
     _,
 };
 
-pub const IO_URING_SOCKET_OP = enum(u16) {
+pub const IO_URING_SOCKET_OP = enum(u32) {
     SIOCIN = 0,
     SIOCOUTQ = 1,
     GETSOCKOPT = 2,
@@ -7042,7 +7116,7 @@ pub const io_uring_buf_reg = extern struct {
     flags: Flags,
     resv: [3]u64,
 
-    pub const Flags = packed struct {
+    pub const Flags = packed struct(u16) {
         _0: u1 = 0,
         /// Incremental buffer consumption.
         inc: bool,
@@ -8631,22 +8705,16 @@ pub const kernel_timespec = extern struct {
     };
 };
 
+/// For use with `utimensat` and `futimens`.
+pub const UTIME = struct {
+    pub const NOW: timespec = .{ .sec = 0, .nsec = 0x3fffffff };
+    pub const OMIT: timespec = .{ .sec = 0, .nsec = 0x3ffffffe };
+};
+
 // https://github.com/ziglang/zig/issues/4726#issuecomment-2190337877
 pub const timespec = if (native_arch == .hexagon or native_arch == .riscv32) kernel_timespec else extern struct {
     sec: isize,
     nsec: isize,
-
-    /// For use with `utimensat` and `futimens`.
-    pub const NOW: timespec = .{
-        .sec = 0,
-        .nsec = 0x3fffffff,
-    };
-
-    /// For use with `utimensat` and `futimens`.
-    pub const OMIT: timespec = .{
-        .sec = 0,
-        .nsec = 0x3ffffffe,
-    };
 };
 
 pub const XDP = struct {
@@ -9444,7 +9512,7 @@ pub const perf_event_attr = extern struct {
     sample_type: u64 = 0,
     read_format: u64 = 0,
 
-    flags: packed struct {
+    flags: packed struct(u64) {
         /// off by default
         disabled: bool = false,
         /// children inherit it

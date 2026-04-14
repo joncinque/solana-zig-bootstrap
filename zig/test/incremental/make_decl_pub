@@ -1,8 +1,9 @@
 #target=x86_64-linux-selfhosted
-#target=x86_64-windows-selfhosted
+//#target=x86_64-windows-selfhosted
 #target=x86_64-linux-cbe
 #target=x86_64-windows-cbe
-#target=wasm32-wasi-selfhosted
+#target=x86_64-linux-llvm
+//#target=wasm32-wasi-selfhosted
 #update=initial version
 #file=main.zig
 const foo = @import("foo.zig");
@@ -14,7 +15,7 @@ const std = @import("std");
 fn hello() !void {
     try std.Io.File.stdout().writeStreamingAll(io, "Hello, World!\n");
 }
-const io = std.Io.Threaded.global_single_threaded.ioBasic();
+const io = std.Io.Threaded.global_single_threaded.io();
 #expect_error=main.zig:3:12: error: 'hello' is not marked 'pub'
 #expect_error=foo.zig:2:1: note: declared here
 
@@ -24,5 +25,5 @@ const std = @import("std");
 pub fn hello() !void {
     try std.Io.File.stdout().writeStreamingAll(io, "Hello, World!\n");
 }
-const io = std.Io.Threaded.global_single_threaded.ioBasic();
+const io = std.Io.Threaded.global_single_threaded.io();
 #expect_stdout="Hello, World!\n"

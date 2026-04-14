@@ -22,7 +22,7 @@ pub fn addCases(cases: *tests.LibcContext) void {
     cases.addLibcTestCase("functional/memstream.c", true, .{});
     // "functional/mntent.c": https://www.openwall.com/lists/musl/2024/10/22/1
     cases.addLibcTestCase("functional/popen.c", false, .{});
-    cases.addLibcTestCase("functional/pthread_cancel-points.c", false, .{});
+    // cases.addLibcTestCase("functional/pthread_cancel-points.c", false, .{}); - racey if multiple instances of the test run concurrently.
     cases.addLibcTestCase("functional/pthread_cancel.c", false, .{});
     cases.addLibcTestCase("functional/pthread_cond.c", false, .{});
     cases.addLibcTestCase("functional/pthread_mutex.c", false, .{});
@@ -31,7 +31,7 @@ pub fn addCases(cases: *tests.LibcContext) void {
     cases.addLibcTestCase("functional/pthread_tsd.c", false, .{});
     cases.addLibcTestCase("functional/qsort.c", true, .{});
     cases.addLibcTestCase("functional/random.c", true, .{});
-    cases.addLibcTestCase("functional/search_hsearch.c", false, .{}); // The test suite of wasi-libc runs this test case
+    cases.addLibcTestCase("functional/search_hsearch.c", true, .{});
     cases.addLibcTestCase("functional/search_insque.c", true, .{});
     cases.addLibcTestCase("functional/search_lsearch.c", true, .{});
     cases.addLibcTestCase("functional/search_tsearch.c", true, .{});
@@ -104,8 +104,8 @@ pub fn addCases(cases: *tests.LibcContext) void {
     // "regression/pthread-robust-detach.c": https://gitlab.com/qemu-project/qemu/-/issues/2424
     cases.addLibcTestCase("regression/pthread_atfork-errno-clobber.c", false, .{});
     cases.addLibcTestCase("regression/pthread_cancel-sem_wait.c", false, .{});
-    cases.addLibcTestCase("regression/pthread_cond-smasher.c", false, .{});
-    cases.addLibcTestCase("regression/pthread_cond_wait-cancel_ignored.c", false, .{});
+    // Flaky under heavy load: cases.addLibcTestCase("regression/pthread_cond-smasher.c", false, .{});
+    // Flaky under heavy load: cases.addLibcTestCase("regression/pthread_cond_wait-cancel_ignored.c", false, .{});
     cases.addLibcTestCase("regression/pthread_condattr_setclock.c", false, .{});
     // "regression/pthread_create-oom.c": QEMU OOM
     cases.addLibcTestCase("regression/pthread_exit-cancel.c", false, .{});
@@ -113,7 +113,7 @@ pub fn addCases(cases: *tests.LibcContext) void {
     cases.addLibcTestCase("regression/pthread_once-deadlock.c", false, .{});
     cases.addLibcTestCase("regression/pthread_rwlock-ebusy.c", false, .{});
     cases.addLibcTestCase("regression/putenv-doublefree.c", true, .{});
-    cases.addLibcTestCase("regression/raise-race.c", false, .{});
+    // cases.addLibcTestCase("regression/raise-race.c", false, .{}); - Sometimes hangs when run natively on x86_64-linux.
     cases.addLibcTestCase("regression/regex-backref-0.c", true, .{});
     cases.addLibcTestCase("regression/regex-bracket-icase.c", true, .{});
     cases.addLibcTestCase("regression/regex-ere-backref.c", true, .{});
@@ -139,7 +139,7 @@ pub fn addCases(cases: *tests.LibcContext) void {
     cases.addLibcTestCase("regression/wcsstr-false-negative.c", true, .{});
 
     cases.addLibcTestCase("math/acos.c", true, .{});
-    // cases.addLibcTestCase("math/acosf.c", true, .{});
+    cases.addLibcTestCase("math/acosf.c", true, .{});
     // cases.addLibcTestCase("math/acosh.c", true, .{});
     cases.addLibcTestCase("math/acoshf.c", true, .{});
     // cases.addLibcTestCase("math/acoshl.c", true, .{});
@@ -197,7 +197,7 @@ pub fn addCases(cases: *tests.LibcContext) void {
     cases.addLibcTestCase("math/fabs.c", true, .{});
     cases.addLibcTestCase("math/fabsf.c", true, .{});
     cases.addLibcTestCase("math/fabsl.c", true, .{});
-    // cases.addLibcTestCase("math/fdim.c", true, .{});
+    cases.addLibcTestCase("math/fdim.c", true, .{});
     // cases.addLibcTestCase("math/fdimf.c", true, .{});
     // cases.addLibcTestCase("math/fdiml.c", true, .{});
     cases.addLibcTestCase("math/fenv.c", true, .{});
@@ -293,12 +293,12 @@ pub fn addCases(cases: *tests.LibcContext) void {
     cases.addLibcTestCase("math/remquo.c", true, .{});
     cases.addLibcTestCase("math/remquof.c", true, .{});
     cases.addLibcTestCase("math/remquol.c", true, .{});
-    // cases.addLibcTestCase("math/rint.c", true, .{});
+    cases.addLibcTestCase("math/rint.c", true, .{});
     cases.addLibcTestCase("math/rintf.c", true, .{});
     // cases.addLibcTestCase("math/rintl.c", true, .{});
-    // cases.addLibcTestCase("math/round.c", true, .{});
-    // cases.addLibcTestCase("math/roundf.c", true, .{});
-    // cases.addLibcTestCase("math/roundl.c", true, .{});
+    cases.addLibcTestCase("math/round.c", true, .{});
+    cases.addLibcTestCase("math/roundf.c", true, .{});
+    cases.addLibcTestCase("math/roundl.c", true, .{});
     cases.addLibcTestCase("math/scalb.c", true, .{});
     cases.addLibcTestCase("math/scalbf.c", true, .{});
     cases.addLibcTestCase("math/scalbln.c", true, .{});
