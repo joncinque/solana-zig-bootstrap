@@ -1,4 +1,4 @@
-# solana-zig-bootstrap v1.52
+# solana-zig-bootstrap v1.53.0
 
 This repo bootstraps the Zig compiler against v1.52 of the
 [Solana LLVM fork](https://github.com/anza-xyz/llvm-project/), which allows you
